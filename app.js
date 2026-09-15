@@ -37,14 +37,20 @@ const LEARNING_FRAMES = 30;
 const HUE_DIFF_THRESHOLD = 8;
 const SATURATION_DIFF_THRESHOLD = 12;
 const VALUE_DIFF_THRESHOLD = 10;
+const DETECTION_CONFIRM_FRAMES = 2;
 
 let stream = null;
 let backgroundHsv = null;
+let backgroundVariance = null;
 let debugMask = null;
 let detectorSizeKey = "";
 let detectorState = "idle";
 let learningFrameCount = 0;
+let detectionConfirmCount = 0;
 let lastDetectionAt = 0;
+// true인 동안은 "실제 통과 직후" 재학습 단계다.
+// 초기/수동 재학습과 구분해야 cooldown 때문에 평상시 배경이 반복 초기화되지 않는다.
+let learningAfterDetection = false;
 let cameraSession = 0;
 let processingLoopId = 0;
 let processingLoopType = "raf";
@@ -85,8 +91,10 @@ function saveState() {
 }
 
 function setStatus(text, state = "loading") {
-  els.statusText.textContent = text;
-  els.statusPill.dataset.state = state;
+  // 같은 상태를 매 프레임 다시 DOM에 쓰지 않는다. 모바일 브라우저에서
+  // 상태 표시가 불필요하게 깜빡이는 현상을 줄인다.
+  if (els.statusText.textContent !== text) els.statusText.textContent = text;
+  if (els.statusPill.dataset.state !== state) els.statusPill.dataset.state = state;
 }
 
 let toastTimer = 0;
@@ -348,11 +356,17 @@ function resizeProcessingCanvas() {
   els.processingCanvas.height = Math.max(2, Math.round(els.video.videoHeight * scale));
 }
 
-function resetDetector() {
+function resetDetector({ afterDetection = false } = {}) {
   backgroundHsv = null;
+  backgroundVariance = null;
   debugMask = null;
   detectorSizeKey = "";
   learningFrameCount = 0;
+  detectionConfirmCount = 0;
+  learningAfterDetection = afterDetection;
+  // 카메라 시작/ROI 변경/수동 초기화는 이전 통과의 cooldown과 무관하다.
+  // 실제 통과 직후 재학습일 때만 lastDetectionAt을 유지한다.
+  if (!afterDetection) lastDetectionAt = 0;
   detectorState = stream && roi ? "learning" : "idle";
   updateMotionMeter(0);
   updateDetectorStatus();
@@ -366,10 +380,13 @@ function updateMotionMeter(value) {
 
 function updateDetectorStatus() {
   if (detectorState === "learning") {
-    const text = learningFrameCount >= LEARNING_FRAMES
-      ? "재감지 대기"
-      : `배경 학습 중 ${learningFrameCount}/${LEARNING_FRAMES}`;
-    setStatus(text, "learning");
+    if (learningAfterDetection && learningFrameCount >= LEARNING_FRAMES) {
+      setStatus("통과 후 배경 안정화 중", "learning");
+    } else {
+      setStatus(`배경 학습 중 ${Math.min(learningFrameCount, LEARNING_FRAMES)}/${LEARNING_FRAMES}`, "learning");
+    }
+  } else if (detectorState === "cooldown") {
+    setStatus("재감지 대기", "learning");
   } else if (detectorState === "ready") {
     if (measuring && !timerStarted) setStatus("첫 통과 대기", "measuring");
     else if (measuring) setStatus("랩타임 측정 중", "measuring");
@@ -384,58 +401,109 @@ function updateDetectorStatus() {
 function initializeDetector(frame, width, height) {
   const pixelCount = width * height;
   backgroundHsv = new Float32Array(pixelCount * 3);
+  backgroundVariance = new Float32Array(pixelCount * 3);
   debugMask = els.debugCanvas.getContext("2d").createImageData(width, height);
   detectorSizeKey = `${width}x${height}`;
   learningFrameCount = 0;
+  detectionConfirmCount = 0;
   for (let dataIndex = 3; dataIndex < debugMask.data.length; dataIndex += 4) debugMask.data[dataIndex] = 255;
   updateBackgroundAndMask(frame, true);
+}
+
+function shortestHueDelta(value, mean) {
+  let delta = value - mean;
+  if (delta > 180) delta -= 360;
+  else if (delta < -180) delta += 360;
+  return delta;
+}
+
+function updateMeanAndVariance(bgIndex, hueDelta, saturationDelta, valueDelta, alpha) {
+  // 평균뿐 아니라 픽셀별 노이즈 분산도 같이 학습한다.
+  // OpenCV MOG2를 웹에서 단순 평균 1개로 대체했을 때 생기던
+  // 자동노출/압축 노이즈 오검지를 줄이기 위한 적응형 배경 모델이다.
+  const oldHueVar = backgroundVariance[bgIndex];
+  const oldSaturationVar = backgroundVariance[bgIndex + 1];
+  const oldValueVar = backgroundVariance[bgIndex + 2];
+
+  backgroundHsv[bgIndex] = (backgroundHsv[bgIndex] + hueDelta * alpha + 360) % 360;
+  backgroundHsv[bgIndex + 1] += saturationDelta * alpha;
+  backgroundHsv[bgIndex + 2] += valueDelta * alpha;
+
+  backgroundVariance[bgIndex] = Math.max(4, (1 - alpha) * (oldHueVar + alpha * hueDelta * hueDelta));
+  backgroundVariance[bgIndex + 1] = Math.max(9, (1 - alpha) * (oldSaturationVar + alpha * saturationDelta * saturationDelta));
+  backgroundVariance[bgIndex + 2] = Math.max(9, (1 - alpha) * (oldValueVar + alpha * valueDelta * valueDelta));
 }
 
 function updateBackgroundAndMask(frame, learning) {
   const pixelCount = frame.width * frame.height;
   const history = Math.max(1, Number(els.historyInput.value));
-  const alpha = learning ? 1 / Math.max(1, learningFrameCount + 1) : 1 / history;
+  const learningAlpha = 1 / Math.max(1, learningFrameCount + 1);
+  const detectingAlpha = 1 / history;
   let changedPixels = 0;
+
   for (let pixel = 0, dataIndex = 0, bgIndex = 0; pixel < pixelCount; pixel += 1, dataIndex += 4, bgIndex += 3) {
     const red = frame.data[dataIndex] / 255;
     const green = frame.data[dataIndex + 1] / 255;
     const blue = frame.data[dataIndex + 2] / 255;
     const high = Math.max(red, green, blue);
     const low = Math.min(red, green, blue);
-    const delta = high - low;
+    const rgbDelta = high - low;
     let hue = 0;
-    if (delta > 0) {
-      if (high === red) hue = 60 * (((green - blue) / delta) % 6);
-      else if (high === green) hue = 60 * ((blue - red) / delta + 2);
-      else hue = 60 * ((red - green) / delta + 4);
+
+    if (rgbDelta > 0) {
+      if (high === red) hue = 60 * (((green - blue) / rgbDelta) % 6);
+      else if (high === green) hue = 60 * ((blue - red) / rgbDelta + 2);
+      else hue = 60 * ((red - green) / rgbDelta + 4);
       if (hue < 0) hue += 360;
     }
-    const saturation = high === 0 ? 0 : delta / high * 255;
+
+    const saturation = high === 0 ? 0 : rgbDelta / high * 255;
     const value = high * 255;
+
     if (learningFrameCount === 0 && learning) {
       backgroundHsv[bgIndex] = hue;
       backgroundHsv[bgIndex + 1] = saturation;
       backgroundHsv[bgIndex + 2] = value;
+      // 초깃값을 0으로 두면 첫 작은 노이즈도 과민하게 잡히므로
+      // 최소 카메라 노이즈 폭을 둔다.
+      backgroundVariance[bgIndex] = 16;
+      backgroundVariance[bgIndex + 1] = 36;
+      backgroundVariance[bgIndex + 2] = 36;
     }
-    let hueDelta = hue - backgroundHsv[bgIndex];
-    if (hueDelta > 180) hueDelta -= 360;
-    else if (hueDelta < -180) hueDelta += 360;
+
+    const hueDelta = shortestHueDelta(hue, backgroundHsv[bgIndex]);
     const saturationDelta = saturation - backgroundHsv[bgIndex + 1];
     const valueDelta = value - backgroundHsv[bgIndex + 2];
-    const changed = !learning && (
-      Math.abs(hueDelta) >= HUE_DIFF_THRESHOLD ||
-      Math.abs(saturationDelta) >= SATURATION_DIFF_THRESHOLD ||
-      Math.abs(valueDelta) >= VALUE_DIFF_THRESHOLD
-    );
+
+    let changed = false;
+    if (!learning) {
+      const hueThreshold = Math.max(HUE_DIFF_THRESHOLD, Math.sqrt(backgroundVariance[bgIndex]) * 3.5);
+      const saturationThreshold = Math.max(SATURATION_DIFF_THRESHOLD, Math.sqrt(backgroundVariance[bgIndex + 1]) * 3.5);
+      const valueThreshold = Math.max(VALUE_DIFF_THRESHOLD, Math.sqrt(backgroundVariance[bgIndex + 2]) * 3.5);
+      changed = Math.abs(hueDelta) >= hueThreshold
+        || Math.abs(saturationDelta) >= saturationThreshold
+        || Math.abs(valueDelta) >= valueThreshold;
+    }
+
     if (changed) changedPixels += 1;
     const maskValue = changed ? 255 : 0;
     debugMask.data[dataIndex] = maskValue;
     debugMask.data[dataIndex + 1] = maskValue;
     debugMask.data[dataIndex + 2] = maskValue;
-    backgroundHsv[bgIndex] = (backgroundHsv[bgIndex] + hueDelta * alpha + 360) % 360;
-    backgroundHsv[bgIndex + 1] += saturationDelta * alpha;
-    backgroundHsv[bgIndex + 2] += valueDelta * alpha;
+
+    // 초기 학습 중에는 전 픽셀을 학습한다. 감지 중에는 전경으로 판정된
+    // 픽셀을 즉시 배경에 섞지 않아 차량이 배경으로 흡수되는 것을 막는다.
+    if (learning || !changed) {
+      updateMeanAndVariance(
+        bgIndex,
+        hueDelta,
+        saturationDelta,
+        valueDelta,
+        learning ? learningAlpha : detectingAlpha
+      );
+    }
   }
+
   if (learning) learningFrameCount += 1;
   return changedPixels / pixelCount * 100;
 }
@@ -480,13 +548,34 @@ function processFrame(now) {
     const motion = updateBackgroundAndMask(frame, learning);
     updateMotionMeter(motion);
     drawDebugMask(width, height);
+
     if (learning) {
+      const learnedEnough = learningFrameCount >= LEARNING_FRAMES;
       const cooldown = Number(els.cooldownInput.value);
-      if (learningFrameCount >= LEARNING_FRAMES && now - lastDetectionAt >= cooldown) detectorState = "ready";
-    } else if (motion > Number(els.sensitivityInput.value)) {
-      lastDetectionAt = now;
-      handlePass(now);
-      resetDetector();
+      // 원본 Android와 동일한 상태 전이:
+      // 1) 최초/수동 학습은 30프레임이 끝나면 바로 DETECTING.
+      // 2) 실제 통과 때문에 reset된 경우에는 최소 30프레임을 학습하고,
+      //    동시에 통과 시점부터 cooldown까지 끝나야 DETECTING으로 복귀한다.
+      const cooldownComplete = !learningAfterDetection || (now - lastDetectionAt >= cooldown);
+      if (learnedEnough && cooldownComplete) {
+        detectorState = "ready";
+        detectionConfirmCount = 0;
+        learningAfterDetection = false;
+      }
+    } else if (detectorState === "ready") {
+      if (motion > Number(els.sensitivityInput.value)) detectionConfirmCount += 1;
+      else detectionConfirmCount = 0;
+
+      // 웹 카메라의 자동노출/압축 노이즈로 한 프레임만 튀는 경우를
+      // 실제 통과로 오인하지 않도록 연속 프레임에서 확인한다.
+      if (detectionConfirmCount >= DETECTION_CONFIRM_FRAMES) {
+        // 여기만이 자동 배경 초기화 경로다.
+        // 즉, 감도 기준을 실제로 넘긴 "통과 확정" 때만 재학습한다.
+        lastDetectionAt = now;
+        detectionConfirmCount = 0;
+        handlePass(now);
+        resetDetector({ afterDetection: true });
+      }
     }
     updateDetectorStatus();
   } catch (error) {
@@ -553,7 +642,9 @@ function startMeasurement() {
   els.timer.textContent = "00:00.00";
   els.measureButton.classList.add("running");
   els.measureButton.lastChild.textContent = " 측정 중지";
-  resetDetector();
+  // 측정 시작은 배경모델을 초기화할 이유가 없다. 원본 Android 동작과
+  // 동일하게 현재 학습된 배경을 그대로 사용한다.
+  updateDetectorStatus();
 }
 
 function stopMeasurement() {
