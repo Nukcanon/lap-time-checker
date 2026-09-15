@@ -30,7 +30,7 @@ const els = {
   toast: document.querySelector("#toast")
 };
 
-const STORAGE_KEY = "nukcanon-lap-time-checker-v5";
+const STORAGE_KEY = "nukcanon-lap-time-checker-v4";
 const PROCESS_MAX_WIDTH = 360;
 const PROCESS_INTERVAL_MS = 24;
 const LEARNING_FRAMES = 30;
