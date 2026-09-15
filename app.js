@@ -31,17 +31,32 @@ const els = {
 };
 
 const STORAGE_KEY = "nukcanon-lap-time-checker-v3";
-const PROCESS_MAX_WIDTH = 480;
-const PROCESS_INTERVAL_MS = 16;
+const PROCESS_MAX_WIDTH = 360;
+const PROCESS_INTERVAL_MS = 24;
 const LEARNING_FRAMES = 30;
-const HUE_DIFF_THRESHOLD = 8;
-const SATURATION_DIFF_THRESHOLD = 12;
-const VALUE_DIFF_THRESHOLD = 10;
 const DETECTION_CONFIRM_FRAMES = 2;
 
+// Android 앱의 MOG2 동작감에 맞추기 위한 웹용 안정화 파라미터.
+// 픽셀 차이를 바로 비교하지 않고, 작은 카메라 이동/자동노출을 먼저 보정한다.
+const MAX_ALIGNMENT_SHIFT = 4;
+const ALIGNMENT_SAMPLE_STEP = 6;
+const LUMA_BASE_THRESHOLD = 18;
+const CHROMA_BASE_THRESHOLD = 14;
+const NOISE_SIGMA_MULTIPLIER = 3.2;
+const MASK_NEIGHBOR_MIN = 4;
+
 let stream = null;
-let backgroundHsv = null;
-let backgroundVariance = null;
+let backgroundY = null;
+let backgroundCb = null;
+let backgroundCr = null;
+let varianceY = null;
+let varianceCb = null;
+let varianceCr = null;
+let currentY = null;
+let currentCb = null;
+let currentCr = null;
+let rawMask = null;
+let cleanMask = null;
 let debugMask = null;
 let detectorSizeKey = "";
 let detectorState = "idle";
@@ -65,7 +80,7 @@ let lapStartedAt = 0;
 
 const saved = loadSavedState();
 let laps = Array.isArray(saved.laps) ? saved.laps : [];
-els.sensitivityInput.value = String(saved.sensitivity ?? 27);
+els.sensitivityInput.value = String(saved.sensitivity ?? 20);
 els.historyInput.value = String(saved.history ?? 1000);
 els.cooldownInput.value = String(saved.cooldown ?? 2000);
 
@@ -357,15 +372,23 @@ function resizeProcessingCanvas() {
 }
 
 function resetDetector({ afterDetection = false } = {}) {
-  backgroundHsv = null;
-  backgroundVariance = null;
+  backgroundY = null;
+  backgroundCb = null;
+  backgroundCr = null;
+  varianceY = null;
+  varianceCb = null;
+  varianceCr = null;
+  currentY = null;
+  currentCb = null;
+  currentCr = null;
+  rawMask = null;
+  cleanMask = null;
   debugMask = null;
   detectorSizeKey = "";
   learningFrameCount = 0;
   detectionConfirmCount = 0;
   learningAfterDetection = afterDetection;
-  // 카메라 시작/ROI 변경/수동 초기화는 이전 통과의 cooldown과 무관하다.
-  // 실제 통과 직후 재학습일 때만 lastDetectionAt을 유지한다.
+  // 실제 통과 직후에만 cooldown 시간을 유지한다.
   if (!afterDetection) lastDetectionAt = 0;
   detectorState = stream && roi ? "learning" : "idle";
   updateMotionMeter(0);
@@ -385,8 +408,6 @@ function updateDetectorStatus() {
     } else {
       setStatus(`배경 학습 중 ${Math.min(learningFrameCount, LEARNING_FRAMES)}/${LEARNING_FRAMES}`, "learning");
     }
-  } else if (detectorState === "cooldown") {
-    setStatus("재감지 대기", "learning");
   } else if (detectorState === "ready") {
     if (measuring && !timerStarted) setStatus("첫 통과 대기", "measuring");
     else if (measuring) setStatus("랩타임 측정 중", "measuring");
@@ -398,113 +419,271 @@ function updateDetectorStatus() {
   }
 }
 
-function initializeDetector(frame, width, height) {
+function allocateDetectorBuffers(width, height) {
   const pixelCount = width * height;
-  backgroundHsv = new Float32Array(pixelCount * 3);
-  backgroundVariance = new Float32Array(pixelCount * 3);
+  backgroundY = new Float32Array(pixelCount);
+  backgroundCb = new Float32Array(pixelCount);
+  backgroundCr = new Float32Array(pixelCount);
+  varianceY = new Float32Array(pixelCount);
+  varianceCb = new Float32Array(pixelCount);
+  varianceCr = new Float32Array(pixelCount);
+  currentY = new Uint8Array(pixelCount);
+  currentCb = new Uint8Array(pixelCount);
+  currentCr = new Uint8Array(pixelCount);
+  rawMask = new Uint8Array(pixelCount);
+  cleanMask = new Uint8Array(pixelCount);
   debugMask = els.debugCanvas.getContext("2d").createImageData(width, height);
   detectorSizeKey = `${width}x${height}`;
   learningFrameCount = 0;
   detectionConfirmCount = 0;
-  for (let dataIndex = 3; dataIndex < debugMask.data.length; dataIndex += 4) debugMask.data[dataIndex] = 255;
-  updateBackgroundAndMask(frame, true);
+  for (let i = 3; i < debugMask.data.length; i += 4) debugMask.data[i] = 255;
 }
 
-function shortestHueDelta(value, mean) {
-  let delta = value - mean;
-  if (delta > 180) delta -= 360;
-  else if (delta < -180) delta += 360;
-  return delta;
-}
-
-function updateMeanAndVariance(bgIndex, hueDelta, saturationDelta, valueDelta, alpha) {
-  // 평균뿐 아니라 픽셀별 노이즈 분산도 같이 학습한다.
-  // OpenCV MOG2를 웹에서 단순 평균 1개로 대체했을 때 생기던
-  // 자동노출/압축 노이즈 오검지를 줄이기 위한 적응형 배경 모델이다.
-  const oldHueVar = backgroundVariance[bgIndex];
-  const oldSaturationVar = backgroundVariance[bgIndex + 1];
-  const oldValueVar = backgroundVariance[bgIndex + 2];
-
-  backgroundHsv[bgIndex] = (backgroundHsv[bgIndex] + hueDelta * alpha + 360) % 360;
-  backgroundHsv[bgIndex + 1] += saturationDelta * alpha;
-  backgroundHsv[bgIndex + 2] += valueDelta * alpha;
-
-  backgroundVariance[bgIndex] = Math.max(4, (1 - alpha) * (oldHueVar + alpha * hueDelta * hueDelta));
-  backgroundVariance[bgIndex + 1] = Math.max(9, (1 - alpha) * (oldSaturationVar + alpha * saturationDelta * saturationDelta));
-  backgroundVariance[bgIndex + 2] = Math.max(9, (1 - alpha) * (oldValueVar + alpha * valueDelta * valueDelta));
-}
-
-function updateBackgroundAndMask(frame, learning) {
+function extractYcbcr(frame) {
+  const source = frame.data;
   const pixelCount = frame.width * frame.height;
-  const history = Math.max(1, Number(els.historyInput.value));
-  const learningAlpha = 1 / Math.max(1, learningFrameCount + 1);
-  const detectingAlpha = 1 / history;
-  let changedPixels = 0;
+  for (let i = 0, p = 0; p < pixelCount; p += 1, i += 4) {
+    const r = source[i];
+    const g = source[i + 1];
+    const b = source[i + 2];
+    // Hue는 저채도 영역에서 크게 튀므로 웹에서는 YCbCr로 비교한다.
+    // Android의 H/S/V MOG2와 목적은 같지만 브라우저 카메라 노이즈에 더 안정적이다.
+    currentY[p] = Math.max(0, Math.min(255, Math.round(0.299 * r + 0.587 * g + 0.114 * b)));
+    currentCb[p] = Math.max(0, Math.min(255, Math.round(128 - 0.168736 * r - 0.331264 * g + 0.5 * b)));
+    currentCr[p] = Math.max(0, Math.min(255, Math.round(128 + 0.5 * r - 0.418688 * g - 0.081312 * b)));
+  }
+}
 
-  for (let pixel = 0, dataIndex = 0, bgIndex = 0; pixel < pixelCount; pixel += 1, dataIndex += 4, bgIndex += 3) {
-    const red = frame.data[dataIndex] / 255;
-    const green = frame.data[dataIndex + 1] / 255;
-    const blue = frame.data[dataIndex + 2] / 255;
-    const high = Math.max(red, green, blue);
-    const low = Math.min(red, green, blue);
-    const rgbDelta = high - low;
-    let hue = 0;
+function initializeDetector(frame, width, height) {
+  allocateDetectorBuffers(width, height);
+  extractYcbcr(frame);
+  const pixelCount = width * height;
+  for (let i = 0; i < pixelCount; i += 1) {
+    backgroundY[i] = currentY[i];
+    backgroundCb[i] = currentCb[i];
+    backgroundCr[i] = currentCr[i];
+    // 첫 프레임에서 분산이 0이면 미세 압축 노이즈까지 전경으로 잡히므로 최소 노이즈 폭을 둔다.
+    varianceY[i] = 64;
+    varianceCb[i] = 36;
+    varianceCr[i] = 36;
+  }
+  rawMask.fill(0);
+  cleanMask.fill(0);
+  learningFrameCount = 1;
+  updateDebugMask(width, height);
+}
 
-    if (rgbDelta > 0) {
-      if (high === red) hue = 60 * (((green - blue) / rgbDelta) % 6);
-      else if (high === green) hue = 60 * ((blue - red) / rgbDelta + 2);
-      else hue = 60 * ((red - green) / rgbDelta + 4);
-      if (hue < 0) hue += 360;
-    }
+function estimateAlignment(width, height) {
+  // 배경 좌표에 대해 현재 프레임이 몇 픽셀 이동했는지 찾는다.
+  // 밝기 자체가 아니라 수평/수직 경계(gradient)를 비교하므로 자동노출 변화에 강하다.
+  // 큰 물체가 ROI 일부를 가려도 한 영역이 정렬 전체를 끌고 가지 않도록 오차를 cap한다.
+  const margin = MAX_ALIGNMENT_SHIFT + 3;
+  if (width <= margin * 2 + 2 || height <= margin * 2 + 2) return { dx: 0, dy: 0, lumaOffset: 0 };
 
-    const saturation = high === 0 ? 0 : rgbDelta / high * 255;
-    const value = high * 255;
+  let bestDx = 0;
+  let bestDy = 0;
+  let bestScore = Number.POSITIVE_INFINITY;
 
-    if (learningFrameCount === 0 && learning) {
-      backgroundHsv[bgIndex] = hue;
-      backgroundHsv[bgIndex + 1] = saturation;
-      backgroundHsv[bgIndex + 2] = value;
-      // 초깃값을 0으로 두면 첫 작은 노이즈도 과민하게 잡히므로
-      // 최소 카메라 노이즈 폭을 둔다.
-      backgroundVariance[bgIndex] = 16;
-      backgroundVariance[bgIndex + 1] = 36;
-      backgroundVariance[bgIndex + 2] = 36;
-    }
-
-    const hueDelta = shortestHueDelta(hue, backgroundHsv[bgIndex]);
-    const saturationDelta = saturation - backgroundHsv[bgIndex + 1];
-    const valueDelta = value - backgroundHsv[bgIndex + 2];
-
-    let changed = false;
-    if (!learning) {
-      const hueThreshold = Math.max(HUE_DIFF_THRESHOLD, Math.sqrt(backgroundVariance[bgIndex]) * 3.5);
-      const saturationThreshold = Math.max(SATURATION_DIFF_THRESHOLD, Math.sqrt(backgroundVariance[bgIndex + 1]) * 3.5);
-      const valueThreshold = Math.max(VALUE_DIFF_THRESHOLD, Math.sqrt(backgroundVariance[bgIndex + 2]) * 3.5);
-      changed = Math.abs(hueDelta) >= hueThreshold
-        || Math.abs(saturationDelta) >= saturationThreshold
-        || Math.abs(valueDelta) >= valueThreshold;
-    }
-
-    if (changed) changedPixels += 1;
-    const maskValue = changed ? 255 : 0;
-    debugMask.data[dataIndex] = maskValue;
-    debugMask.data[dataIndex + 1] = maskValue;
-    debugMask.data[dataIndex + 2] = maskValue;
-
-    // 초기 학습 중에는 전 픽셀을 학습한다. 감지 중에는 전경으로 판정된
-    // 픽셀을 즉시 배경에 섞지 않아 차량이 배경으로 흡수되는 것을 막는다.
-    if (learning || !changed) {
-      updateMeanAndVariance(
-        bgIndex,
-        hueDelta,
-        saturationDelta,
-        valueDelta,
-        learning ? learningAlpha : detectingAlpha
-      );
+  for (let dy = -MAX_ALIGNMENT_SHIFT; dy <= MAX_ALIGNMENT_SHIFT; dy += 1) {
+    for (let dx = -MAX_ALIGNMENT_SHIFT; dx <= MAX_ALIGNMENT_SHIFT; dx += 1) {
+      let scoreSum = 0;
+      let count = 0;
+      for (let y = margin; y < height - margin; y += ALIGNMENT_SAMPLE_STEP) {
+        const bgRow = y * width;
+        const bgRowUp = (y - 1) * width;
+        const bgRowDown = (y + 1) * width;
+        const cy = y + dy;
+        const curRow = cy * width;
+        const curRowUp = (cy - 1) * width;
+        const curRowDown = (cy + 1) * width;
+        for (let x = margin; x < width - margin; x += ALIGNMENT_SAMPLE_STEP) {
+          const cx = x + dx;
+          const bgGx = backgroundY[bgRow + x + 1] - backgroundY[bgRow + x - 1];
+          const bgGy = backgroundY[bgRowDown + x] - backgroundY[bgRowUp + x];
+          const curGx = currentY[curRow + cx + 1] - currentY[curRow + cx - 1];
+          const curGy = currentY[curRowDown + cx] - currentY[curRowUp + cx];
+          const dgx = curGx - bgGx;
+          const dgy = curGy - bgGy;
+          scoreSum += Math.min(900, dgx * dgx + dgy * dgy);
+          count += 1;
+        }
+      }
+      if (!count) continue;
+      const score = scoreSum / count + (Math.abs(dx) + Math.abs(dy)) * 0.2;
+      if (score < bestScore) {
+        bestScore = score;
+        bestDx = dx;
+        bestDy = dy;
+      }
     }
   }
 
-  if (learning) learningFrameCount += 1;
+  // 선택된 정렬 위치에서 밝기 차이의 median을 구해 자동노출/조명 변화를 보정한다.
+  // 움직이는 물체는 이상치가 되므로 평균보다 median이 훨씬 안정적이다.
+  const histogram = new Int32Array(129); // -64..+64
+  let sampleCount = 0;
+  for (let y = margin; y < height - margin; y += ALIGNMENT_SAMPLE_STEP) {
+    const bgRow = y * width;
+    const curRow = (y + bestDy) * width;
+    for (let x = margin; x < width - margin; x += ALIGNMENT_SAMPLE_STEP) {
+      const diff = Math.max(-64, Math.min(64, Math.round(currentY[curRow + x + bestDx] - backgroundY[bgRow + x])));
+      histogram[diff + 64] += 1;
+      sampleCount += 1;
+    }
+  }
+  let lumaOffset = 0;
+  if (sampleCount) {
+    const middle = Math.floor(sampleCount / 2);
+    let accumulated = 0;
+    for (let i = 0; i < histogram.length; i += 1) {
+      accumulated += histogram[i];
+      if (accumulated > middle) {
+        lumaOffset = i - 64;
+        break;
+      }
+    }
+  }
+
+  return {
+    dx: bestDx,
+    dy: bestDy,
+    lumaOffset: Math.max(-32, Math.min(32, lumaOffset))
+  };
+}
+
+function filterMotionMask(width, height) {
+  cleanMask.fill(0);
+  let changed = 0;
+
+  // 3x3 이웃 중 일정 수 이상이 함께 변할 때만 전경으로 인정한다.
+  // JPEG 노이즈, 센서 점 노이즈, 얇은 흔들림 경계를 대부분 제거한다.
+  for (let y = 1; y < height - 1; y += 1) {
+    const row = y * width;
+    for (let x = 1; x < width - 1; x += 1) {
+      const i = row + x;
+      if (!rawMask[i]) continue;
+      let neighbors = 0;
+      for (let oy = -1; oy <= 1; oy += 1) {
+        const nrow = (y + oy) * width;
+        for (let ox = -1; ox <= 1; ox += 1) neighbors += rawMask[nrow + x + ox];
+      }
+      if (neighbors >= MASK_NEIGHBOR_MIN) {
+        cleanMask[i] = 1;
+        changed += 1;
+      }
+    }
+  }
+  return changed;
+}
+
+function updateBackgroundPixel(i, curIndex, alpha, lumaResidual, cbResidual, crResidual) {
+  const oldY = backgroundY[i];
+  const oldCb = backgroundCb[i];
+  const oldCr = backgroundCr[i];
+
+  backgroundY[i] = oldY + (currentY[curIndex] - oldY) * alpha;
+  backgroundCb[i] = oldCb + (currentCb[curIndex] - oldCb) * alpha;
+  backgroundCr[i] = oldCr + (currentCr[curIndex] - oldCr) * alpha;
+
+  varianceY[i] = Math.max(25, (1 - alpha) * (varianceY[i] + alpha * lumaResidual * lumaResidual));
+  varianceCb[i] = Math.max(16, (1 - alpha) * (varianceCb[i] + alpha * cbResidual * cbResidual));
+  varianceCr[i] = Math.max(16, (1 - alpha) * (varianceCr[i] + alpha * crResidual * crResidual));
+}
+
+function updateDebugMask(width, height) {
+  const pixelCount = width * height;
+  for (let p = 0, i = 0; p < pixelCount; p += 1, i += 4) {
+    const value = cleanMask[p] ? 255 : 0;
+    debugMask.data[i] = value;
+    debugMask.data[i + 1] = value;
+    debugMask.data[i + 2] = value;
+  }
+}
+
+function updateBackgroundAndMask(frame, learning) {
+  const width = frame.width;
+  const height = frame.height;
+  const pixelCount = width * height;
+  extractYcbcr(frame);
+  const alignment = estimateAlignment(width, height);
+  const history = Math.max(1, Number(els.historyInput.value));
+
+  rawMask.fill(0);
+  cleanMask.fill(0);
+
+  if (learning) {
+    // MOG2의 초기 빠른 적응을 흉내낸다. 20프레임 이후에도 0.05로 계속 학습하여
+    // 통과 직후 자동차가 아직 ROI에 남아 있더라도 cooldown 동안 새 배경으로 회복한다.
+    const alpha = 1 / Math.min(Math.max(2, learningFrameCount + 1), 20);
+    for (let y = 0; y < height; y += 1) {
+      const cy = y + alignment.dy;
+      if (cy < 0 || cy >= height) continue;
+      const row = y * width;
+      const curRow = cy * width;
+      for (let x = 0; x < width; x += 1) {
+        const cx = x + alignment.dx;
+        if (cx < 0 || cx >= width) continue;
+        const i = row + x;
+        const curIndex = curRow + cx;
+        const lumaResidual = currentY[curIndex] - backgroundY[i] - alignment.lumaOffset;
+        const cbResidual = currentCb[curIndex] - backgroundCb[i];
+        const crResidual = currentCr[curIndex] - backgroundCr[i];
+        updateBackgroundPixel(i, curIndex, alpha, lumaResidual, cbResidual, crResidual);
+      }
+    }
+    learningFrameCount += 1;
+    updateDebugMask(width, height);
+    return 0;
+  }
+
+  // 1) 전경 후보 생성. 배경 분산이 큰 픽셀은 자동으로 임계값을 높인다.
+  for (let y = MAX_ALIGNMENT_SHIFT; y < height - MAX_ALIGNMENT_SHIFT; y += 1) {
+    const cy = y + alignment.dy;
+    if (cy < 0 || cy >= height) continue;
+    const row = y * width;
+    const curRow = cy * width;
+    for (let x = MAX_ALIGNMENT_SHIFT; x < width - MAX_ALIGNMENT_SHIFT; x += 1) {
+      const cx = x + alignment.dx;
+      if (cx < 0 || cx >= width) continue;
+      const i = row + x;
+      const curIndex = curRow + cx;
+      const dY = currentY[curIndex] - backgroundY[i] - alignment.lumaOffset;
+      const dCb = currentCb[curIndex] - backgroundCb[i];
+      const dCr = currentCr[curIndex] - backgroundCr[i];
+
+      const yThreshold = Math.max(LUMA_BASE_THRESHOLD, Math.sqrt(varianceY[i]) * NOISE_SIGMA_MULTIPLIER);
+      const cbThreshold = Math.max(CHROMA_BASE_THRESHOLD, Math.sqrt(varianceCb[i]) * NOISE_SIGMA_MULTIPLIER);
+      const crThreshold = Math.max(CHROMA_BASE_THRESHOLD, Math.sqrt(varianceCr[i]) * NOISE_SIGMA_MULTIPLIER);
+      const chromaChanged = (dCb * dCb + dCr * dCr) > (cbThreshold * cbThreshold + crThreshold * crThreshold);
+
+      if (Math.abs(dY) > yThreshold || chromaChanged) rawMask[i] = 1;
+    }
+  }
+
+  // 2) 점 노이즈/얇은 경계 제거 후 최종 변화율 계산.
+  const changedPixels = filterMotionMask(width, height);
+
+  // 3) 배경 픽셀만 천천히 적응. 전경은 즉시 배경으로 흡수하지 않는다.
+  const alpha = 1 / history;
+  for (let y = 0; y < height; y += 1) {
+    const cy = y + alignment.dy;
+    if (cy < 0 || cy >= height) continue;
+    const row = y * width;
+    const curRow = cy * width;
+    for (let x = 0; x < width; x += 1) {
+      const cx = x + alignment.dx;
+      if (cx < 0 || cx >= width) continue;
+      const i = row + x;
+      if (cleanMask[i]) continue;
+      const curIndex = curRow + cx;
+      const lumaResidual = currentY[curIndex] - backgroundY[i] - alignment.lumaOffset;
+      const cbResidual = currentCb[curIndex] - backgroundCb[i];
+      const crResidual = currentCr[curIndex] - backgroundCr[i];
+      updateBackgroundPixel(i, curIndex, alpha, lumaResidual, cbResidual, crResidual);
+    }
+  }
+
+  updateDebugMask(width, height);
   return changedPixels / pixelCount * 100;
 }
 
@@ -536,7 +715,7 @@ function processFrame(now) {
     const height = Math.max(1, Math.min(els.processingCanvas.height - y, Math.ceil((mapped.bottom - mapped.top) * scaleY)));
     const frame = ctx.getImageData(x, y, width, height);
     const sizeKey = `${width}x${height}`;
-    if (!backgroundHsv || detectorSizeKey !== sizeKey) {
+    if (!backgroundY || detectorSizeKey !== sizeKey) {
       initializeDetector(frame, width, height);
       detectorState = "learning";
       updateMotionMeter(0);
