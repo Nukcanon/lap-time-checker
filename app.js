@@ -30,20 +30,20 @@ const els = {
   toast: document.querySelector("#toast")
 };
 
-const STORAGE_KEY = "nukcanon-lap-time-checker-v3";
+const STORAGE_KEY = "nukcanon-lap-time-checker-v4";
 const PROCESS_MAX_WIDTH = 360;
 const PROCESS_INTERVAL_MS = 24;
 const LEARNING_FRAMES = 30;
-const DETECTION_CONFIRM_FRAMES = 2;
+const DETECTION_CONFIRM_FRAMES = 1;
 
 // Android 앱의 MOG2 동작감에 맞추기 위한 웹용 안정화 파라미터.
 // 픽셀 차이를 바로 비교하지 않고, 작은 카메라 이동/자동노출을 먼저 보정한다.
-const MAX_ALIGNMENT_SHIFT = 4;
+const MAX_ALIGNMENT_SHIFT = 2;
 const ALIGNMENT_SAMPLE_STEP = 6;
-const LUMA_BASE_THRESHOLD = 18;
-const CHROMA_BASE_THRESHOLD = 14;
-const NOISE_SIGMA_MULTIPLIER = 3.2;
-const MASK_NEIGHBOR_MIN = 4;
+const LUMA_BASE_THRESHOLD = 11;
+const CHROMA_BASE_THRESHOLD = 9;
+const NOISE_SIGMA_MULTIPLIER = 2.4;
+const MASK_NEIGHBOR_MIN = 1;
 
 let stream = null;
 let backgroundY = null;
@@ -552,27 +552,12 @@ function estimateAlignment(width, height) {
 }
 
 function filterMotionMask(width, height) {
-  cleanMask.fill(0);
+  // Android 원본은 MOG2가 만든 H/S/V 마스크를 OR 한 뒤 morphology 없이
+  // countNonZero()를 바로 사용한다. 웹에서도 실제 물체 면적을 깎지 않도록
+  // v3의 강한 3x3 이웃 필터를 제거하고 원시 전경 마스크를 그대로 센다.
+  cleanMask.set(rawMask);
   let changed = 0;
-
-  // 3x3 이웃 중 일정 수 이상이 함께 변할 때만 전경으로 인정한다.
-  // JPEG 노이즈, 센서 점 노이즈, 얇은 흔들림 경계를 대부분 제거한다.
-  for (let y = 1; y < height - 1; y += 1) {
-    const row = y * width;
-    for (let x = 1; x < width - 1; x += 1) {
-      const i = row + x;
-      if (!rawMask[i]) continue;
-      let neighbors = 0;
-      for (let oy = -1; oy <= 1; oy += 1) {
-        const nrow = (y + oy) * width;
-        for (let ox = -1; ox <= 1; ox += 1) neighbors += rawMask[nrow + x + ox];
-      }
-      if (neighbors >= MASK_NEIGHBOR_MIN) {
-        cleanMask[i] = 1;
-        changed += 1;
-      }
-    }
-  }
+  for (let i = 0; i < rawMask.length; i += 1) changed += rawMask[i] ? 1 : 0;
   return changed;
 }
 
@@ -660,7 +645,7 @@ function updateBackgroundAndMask(frame, learning) {
     }
   }
 
-  // 2) 점 노이즈/얇은 경계 제거 후 최종 변화율 계산.
+  // 2) Android 원본처럼 전경 마스크를 그대로 최종 변화율에 사용.
   const changedPixels = filterMotionMask(width, height);
 
   // 3) 배경 픽셀만 천천히 적응. 전경은 즉시 배경으로 흡수하지 않는다.
@@ -745,8 +730,7 @@ function processFrame(now) {
       if (motion > Number(els.sensitivityInput.value)) detectionConfirmCount += 1;
       else detectionConfirmCount = 0;
 
-      // 웹 카메라의 자동노출/압축 노이즈로 한 프레임만 튀는 경우를
-      // 실제 통과로 오인하지 않도록 연속 프레임에서 확인한다.
+      // Android 원본과 동일하게 한 프레임에서 기준을 넘으면 즉시 통과로 확정한다.
       if (detectionConfirmCount >= DETECTION_CONFIRM_FRAMES) {
         // 여기만이 자동 배경 초기화 경로다.
         // 즉, 감도 기준을 실제로 넘긴 "통과 확정" 때만 재학습한다.
