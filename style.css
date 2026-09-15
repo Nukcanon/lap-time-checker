@@ -60,7 +60,16 @@ button, select, input[type="range"] { touch-action: manipulation; }
 }
 
 .brand, .home-link { color: #fff; text-decoration: none; }
-.brand { display: inline-flex; align-items: center; }
+.brand { display: inline-flex; align-items: center; gap: 11px; }
+.brand::before {
+  content: "";
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  border-radius: 11px;
+  background: #0066cc url("https://nukcanon.github.io/nukcanon/image/nukcanon-brand.png?v=20260915") center / cover no-repeat;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .18);
+}
 .brand-copy { display: grid; gap: 1px; }
 .brand-copy strong { font-size: 1.23rem; letter-spacing: -.025em; line-height: 1.2; }
 .brand-copy small { color: rgba(255, 255, 255, .72); font-size: .67rem; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
@@ -169,6 +178,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 @media (max-width: 680px) {
   .header-inner, .workspace { width: min(100% - 20px, 1180px); }
   .header-inner { min-height: 64px; }
+  .brand::before { width: 38px; height: 38px; flex-basis: 38px; border-radius: 9px; }
   .brand-copy small { display: none; }
   .home-link { width: 40px; padding: 0; gap: 0; }
   .home-link span { display: none; }
@@ -202,4 +212,3 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
-
