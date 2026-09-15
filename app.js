@@ -30,7 +30,7 @@ const els = {
   toast: document.querySelector("#toast")
 };
 
-const STORAGE_KEY = "nukcanon-lap-time-checker-v4";
+const STORAGE_KEY = "nukcanon-lap-time-checker-v5";
 const PROCESS_MAX_WIDTH = 360;
 const PROCESS_INTERVAL_MS = 24;
 const LEARNING_FRAMES = 30;
@@ -40,9 +40,9 @@ const DETECTION_CONFIRM_FRAMES = 1;
 // 픽셀 차이를 바로 비교하지 않고, 작은 카메라 이동/자동노출을 먼저 보정한다.
 const MAX_ALIGNMENT_SHIFT = 2;
 const ALIGNMENT_SAMPLE_STEP = 6;
-const LUMA_BASE_THRESHOLD = 11;
-const CHROMA_BASE_THRESHOLD = 9;
-const NOISE_SIGMA_MULTIPLIER = 2.4;
+const LUMA_BASE_THRESHOLD = 8;
+const CHROMA_BASE_THRESHOLD = 7;
+const NOISE_SIGMA_MULTIPLIER = 2.2;
 const MASK_NEIGHBOR_MIN = 1;
 
 let stream = null;
@@ -106,8 +106,7 @@ function saveState() {
 }
 
 function setStatus(text, state = "loading") {
-  // 같은 상태를 매 프레임 다시 DOM에 쓰지 않는다. 모바일 브라우저에서
-  // 상태 표시가 불필요하게 깜빡이는 현상을 줄인다.
+  // 같은 상태는 다시 그리지 않는다.
   if (els.statusText.textContent !== text) els.statusText.textContent = text;
   if (els.statusPill.dataset.state !== state) els.statusPill.dataset.state = state;
 }
@@ -552,12 +551,25 @@ function estimateAlignment(width, height) {
 }
 
 function filterMotionMask(width, height) {
-  // Android 원본은 MOG2가 만든 H/S/V 마스크를 OR 한 뒤 morphology 없이
-  // countNonZero()를 바로 사용한다. 웹에서도 실제 물체 면적을 깎지 않도록
-  // v3의 강한 3x3 이웃 필터를 제거하고 원시 전경 마스크를 그대로 센다.
-  cleanMask.set(rawMask);
+  cleanMask.fill(0);
   let changed = 0;
-  for (let i = 0; i < rawMask.length; i += 1) changed += rawMask[i] ? 1 : 0;
+  for (let y = 1; y < height - 1; y += 1) {
+    const row = y * width;
+    for (let x = 1; x < width - 1; x += 1) {
+      const i = row + x;
+      if (!rawMask[i]) continue;
+      let neighbors = 0;
+      for (let oy = -1; oy <= 1; oy += 1) {
+        for (let ox = -1; ox <= 1; ox += 1) {
+          if ((ox || oy) && rawMask[i + oy * width + ox]) neighbors += 1;
+        }
+      }
+      if (neighbors >= MASK_NEIGHBOR_MIN) {
+        cleanMask[i] = 1;
+        changed += 1;
+      }
+    }
+  }
   return changed;
 }
 
@@ -585,7 +597,7 @@ function updateDebugMask(width, height) {
   }
 }
 
-function updateBackgroundAndMask(frame, learning) {
+function updateBackgroundAndMask(frame, learning, fastIdleAdaptation = false) {
   const width = frame.width;
   const height = frame.height;
   const pixelCount = width * height;
@@ -648,7 +660,7 @@ function updateBackgroundAndMask(frame, learning) {
   // 2) Android 원본처럼 전경 마스크를 그대로 최종 변화율에 사용.
   const changedPixels = filterMotionMask(width, height);
 
-  // 3) 배경 픽셀만 천천히 적응. 전경은 즉시 배경으로 흡수하지 않는다.
+  // 3) 모든 픽셀을 적응시킨다. 대기 중 전경은 조금 더 빨리 안정화한다.
   const alpha = 1 / history;
   for (let y = 0; y < height; y += 1) {
     const cy = y + alignment.dy;
@@ -659,12 +671,12 @@ function updateBackgroundAndMask(frame, learning) {
       const cx = x + alignment.dx;
       if (cx < 0 || cx >= width) continue;
       const i = row + x;
-      if (cleanMask[i]) continue;
       const curIndex = curRow + cx;
       const lumaResidual = currentY[curIndex] - backgroundY[i] - alignment.lumaOffset;
       const cbResidual = currentCb[curIndex] - backgroundCb[i];
       const crResidual = currentCr[curIndex] - backgroundCr[i];
-      updateBackgroundPixel(i, curIndex, alpha, lumaResidual, cbResidual, crResidual);
+      const pixelAlpha = cleanMask[i] && fastIdleAdaptation ? Math.max(alpha, 0.01) : alpha;
+      updateBackgroundPixel(i, curIndex, pixelAlpha, lumaResidual, cbResidual, crResidual);
     }
   }
 
@@ -680,6 +692,36 @@ function drawDebugMask(width, height) {
   }
   els.debugCanvas.getContext("2d").putImageData(debugMask, 0, 0);
   els.debugSize.textContent = `${width} × ${height}`;
+}
+
+function advanceDetectorState(now, motion) {
+  if (detectorState === "learning") {
+    const learnedEnough = learningFrameCount >= LEARNING_FRAMES;
+    const cooldown = Number(els.cooldownInput.value);
+    const cooldownComplete = !learningAfterDetection || (now - lastDetectionAt >= cooldown);
+    if (learnedEnough && cooldownComplete) {
+      detectorState = "ready";
+      detectionConfirmCount = 0;
+      learningAfterDetection = false;
+    }
+    return;
+  }
+
+  if (detectorState !== "ready") return;
+  if (!measuring) {
+    detectionConfirmCount = 0;
+    return;
+  }
+
+  if (motion > Number(els.sensitivityInput.value)) detectionConfirmCount += 1;
+  else detectionConfirmCount = 0;
+
+  if (detectionConfirmCount >= DETECTION_CONFIRM_FRAMES) {
+    lastDetectionAt = now;
+    detectionConfirmCount = 0;
+    handlePass(now);
+    resetDetector({ afterDetection: true });
+  }
 }
 
 function processFrame(now) {
@@ -709,37 +751,10 @@ function processFrame(now) {
       return;
     }
     const learning = detectorState === "learning";
-    const motion = updateBackgroundAndMask(frame, learning);
+    const motion = updateBackgroundAndMask(frame, learning, !measuring);
     updateMotionMeter(motion);
     drawDebugMask(width, height);
-
-    if (learning) {
-      const learnedEnough = learningFrameCount >= LEARNING_FRAMES;
-      const cooldown = Number(els.cooldownInput.value);
-      // 원본 Android와 동일한 상태 전이:
-      // 1) 최초/수동 학습은 30프레임이 끝나면 바로 DETECTING.
-      // 2) 실제 통과 때문에 reset된 경우에는 최소 30프레임을 학습하고,
-      //    동시에 통과 시점부터 cooldown까지 끝나야 DETECTING으로 복귀한다.
-      const cooldownComplete = !learningAfterDetection || (now - lastDetectionAt >= cooldown);
-      if (learnedEnough && cooldownComplete) {
-        detectorState = "ready";
-        detectionConfirmCount = 0;
-        learningAfterDetection = false;
-      }
-    } else if (detectorState === "ready") {
-      if (motion > Number(els.sensitivityInput.value)) detectionConfirmCount += 1;
-      else detectionConfirmCount = 0;
-
-      // Android 원본과 동일하게 한 프레임에서 기준을 넘으면 즉시 통과로 확정한다.
-      if (detectionConfirmCount >= DETECTION_CONFIRM_FRAMES) {
-        // 여기만이 자동 배경 초기화 경로다.
-        // 즉, 감도 기준을 실제로 넘긴 "통과 확정" 때만 재학습한다.
-        lastDetectionAt = now;
-        detectionConfirmCount = 0;
-        handlePass(now);
-        resetDetector({ afterDetection: true });
-      }
-    }
+    advanceDetectorState(now, motion);
     updateDetectorStatus();
   } catch (error) {
     console.error(error);
