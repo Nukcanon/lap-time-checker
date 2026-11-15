@@ -134,6 +134,8 @@ button, select, input[type="range"] { touch-action: manipulation; }
 .button-accent.running { background: linear-gradient(135deg, #e14e62, #c43d51); box-shadow: 0 8px 18px rgba(196,61,81,.18); }
 .button-secondary { color: #334155; border: 1px solid #dce5ef; background: #f4f7fb; }
 .button-secondary:hover:not(:disabled) { background: #eaf1f8; }
+.button-secondary[aria-pressed="true"] { color: #fff; border-color: var(--primary); background: var(--primary); }
+.button-secondary[aria-pressed="true"]:hover:not(:disabled) { background: var(--primary-dark); }
 .camera-help { margin: 0; padding: 3px 16px 15px; color: var(--muted); font-size: .78rem; line-height: 1.5; }
 
 .side-column { display: grid; gap: 16px; }
@@ -167,10 +169,15 @@ button, select, input[type="range"] { touch-action: manipulation; }
 .field select { width: 100%; min-height: 42px; padding: 0 11px; border: 1px solid #d5e0eb; border-radius: 10px; color: #334155; background: #fff; }
 .field input[type="range"] { width: 100%; accent-color: var(--primary); }
 
-.debug-panel { margin-top: 16px; padding: 10px; border: 1px solid #dce5ef; border-radius: 11px; background: #101923; }
+.debug-panel { margin: 0 14px 12px; padding: 10px; border: 1px solid #dce5ef; border-radius: 11px; background: #101923; }
+.debug-info { margin: 8px 0 0; color: #dbe7f3; font-size: .74rem; font-variant-numeric: tabular-nums; }
+.debug-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0 0; color: #8298ae; font-size: .68rem; }
+.debug-chip { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+.debug-chip-object { background: #fff; }
+.debug-chip-weak { margin-left: 8px; background: #5a5a5a; }
 .debug-heading { display: flex; justify-content: space-between; margin-bottom: 8px; color: #dbe7f3; font-size: .7rem; }
 .debug-heading span { color: #8298ae; }
-#debugCanvas { display: block; width: 100%; height: auto; max-height: 150px; border-radius: 7px; background: #000; object-fit: contain; }
+#debugCanvas { display: block; width: 100%; height: auto; max-height: 180px; border-radius: 7px; background: #000; object-fit: contain; }
 
 .toast { position: fixed; z-index: 20; left: 50%; bottom: max(22px, env(safe-area-inset-bottom)); max-width: calc(100% - 32px); padding: 11px 15px; border-radius: 10px; color: #fff; background: rgba(17,24,39,.94); box-shadow: 0 12px 30px rgba(0,0,0,.18); font-size: .82rem; opacity: 0; pointer-events: none; transform: translate(-50%, 12px); transition: opacity .18s ease, transform .18s ease; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }

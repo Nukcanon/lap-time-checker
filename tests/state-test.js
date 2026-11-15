@@ -1,8 +1,9 @@
 "use strict";
-// 감지기의 상태 전환과 핵심 규칙을 가짜 화면으로 확인한다. 실행: node tests/state-test.js
+// 감지기의 상태 전환과 핵심 규칙을 가짜 화면으로 확인한다. 실행: node tests/state-test.js [app.js 경로]
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const path = require("node:path");
 const vm = require("node:vm");
 
 const toasts = [];
@@ -60,57 +61,87 @@ const context = {
 };
 context.globalThis = context;
 vm.createContext(context);
-vm.runInContext(fs.readFileSync(`${__dirname}/../app.js`, "utf8"), context);
+vm.runInContext(fs.readFileSync(process.argv[2] || path.join(__dirname, "..", "app.js"), "utf8"), context);
 
 const evaluate = (source) => vm.runInContext(source, context);
 elements.get("#toast").classList.add = () => toasts.push(elements.get("#toast").textContent);
 
+// 한 프레임을 판정기에 넣는다. move를 생략하면 "변한 곳이 전부 움직이는 중"으로 본다.
+evaluate(`function step(time, motion, o = {}) {
+  frameShake = !!o.shake; frameBright = !!o.bright; frameBeyond = !!o.beyond;
+  moveMotion = o.move === undefined ? motion : o.move;
+  advanceDetectorState(time, motion);
+}
+function ready() { detectorState = "ready"; disturbedSince = 0; holdFrames = 0; coverSince = 0; slowSince = 0; staleFrames = 0; recentPeak = 0; pendingPeak = 0; }`);
+
 // --- 기본값 ---
 assert.equal(evaluate("els.autoThresholdInput.checked"), true, "감지 기준 자동이 기본");
-assert.equal(evaluate("els.ignoreShakeInput.checked"), true, "충격·조명 변화 무시가 기본");
+assert.equal(evaluate("els.ignoreShakeInput.checked"), true, "흔들림·조명 변화 무시가 기본");
 assert.equal(evaluate("els.lockCameraInput.checked"), false, "초점·색 고정은 기본으로 꺼짐");
 
 evaluate('stream = {}; roi = { left: 0, top: 0, right: 1, bottom: 1 }; els.cooldownInput.value = "2000"; els.autoThresholdInput.checked = false; els.sensitivityInput.value = "20";');
 
 // --- 상태 전환 ---
-evaluate('detectorState = "ready"; measuring = false; advanceDetectorState(1000, 100);');
+evaluate("ready(); measuring = false; step(1000, 100);");
 assert.equal(evaluate("detectorState"), "ready", "측정 중이 아니면 통과로 치지 않는다");
 
-evaluate('detectorState = "learning"; learningFrameCount = 30; learningAfterDetection = false; advanceDetectorState(1000, 0);');
+evaluate('detectorState = "learning"; learningFrameCount = 30; learningAfterDetection = false; step(1000, 0);');
 assert.equal(evaluate("detectorState"), "ready");
 
-evaluate('detectorState = "ready"; measuring = true; timerStarted = false; advanceDetectorState(3000, 25);');
+evaluate("ready(); measuring = true; timerStarted = false; step(3000, 25);");
 assert.equal(evaluate("detectorState"), "learning");
 assert.equal(evaluate("learningAfterDetection"), true);
 assert.equal(evaluate("lastDetectionAt"), 3000);
 assert.equal(evaluate("timerStarted"), true, "첫 통과가 타이머를 시작한다");
 
-evaluate("learningFrameCount = 30; advanceDetectorState(4000, 0);");
+evaluate("learningFrameCount = 30; step(4000, 0);");
 assert.equal(evaluate("detectorState"), "learning", "재감지 대기시간 전에는 준비되지 않는다");
-evaluate("advanceDetectorState(5000, 0);");
+evaluate("step(5000, 0);");
 assert.equal(evaluate("detectorState"), "ready");
 
-// --- 충격·조명 변화 무시 ---
-evaluate('detectorState = "ready"; measuring = true; disturbedSince = 0; holdFrames = 0; advanceDetectorState(6000, 50, false);');
-assert.equal(evaluate("detectorState"), "ready", "불안정한 프레임의 큰 변화는 통과가 아니다");
+// --- 흔들림 ---
+evaluate("ready(); measuring = true; step(6000, 50, { shake: true });");
+assert.equal(evaluate("detectorState"), "ready", "급하게 흔들린 프레임의 큰 변화는 통과가 아니다");
 assert.ok(evaluate("disturbedSince") > 0);
-evaluate("advanceDetectorState(6033, 50, true);");
+evaluate("step(6033, 50);");
 assert.equal(evaluate("detectorState"), "ready", "변화가 가라앉기 전에는 통과로 치지 않는다");
-evaluate("advanceDetectorState(6066, 0, true); advanceDetectorState(6100, 0, true); advanceDetectorState(6133, 0, true);");
+evaluate("step(6066, 0); step(6100, 0); step(6133, 0);");
 assert.equal(evaluate("disturbedSince"), 0, "변화가 3프레임 가라앉으면 감지를 다시 시작한다");
-evaluate("advanceDetectorState(6166, 0, true); advanceDetectorState(6200, 0, true);");
-evaluate("advanceDetectorState(8000, 50, true);");
-assert.equal(evaluate("lastDetectionAt"), 8000, "안정된 프레임의 큰 변화는 통과다");
+evaluate("step(6166, 0); step(6200, 0); step(8000, 50);");
+assert.equal(evaluate("lastDetectionAt"), 8000, "흔들림이 없는 프레임의 큰 변화는 통과다");
 
-evaluate('detectorState = "ready"; disturbedSince = 0; holdFrames = 0; advanceDetectorState(9000, 1, false); advanceDetectorState(9033, 1, false);');
+evaluate("ready(); step(9000, 1, { shake: true }); step(9033, 1, { shake: true });");
 assert.equal(evaluate("disturbedSince"), 0, "흔들려도 변화율이 기준 아래면 감지를 멈추지 않는다");
 
-evaluate('detectorState = "ready"; disturbedSince = 0; holdFrames = 0; advanceDetectorState(10000, 50, false); advanceDetectorState(10500, 50, true); advanceDetectorState(11001, 50, true);');
+evaluate("ready(); step(10000, 50, { shake: true }); step(10500, 50); step(11001, 50);");
 assert.equal(evaluate("detectorState"), "learning", "1초 넘게 돌아오지 않으면 배경을 다시 배운다");
 assert.equal(evaluate("learningAfterDetection"), false);
 
-evaluate('els.ignoreShakeInput.checked = false; detectorState = "ready"; measuring = true; advanceDetectorState(13000, 50, false);');
-assert.equal(evaluate("lastDetectionAt"), 13000, "기능을 끄면 예전처럼 바로 통과로 친다");
+// --- 움직임 확인: 변했지만 움직이는 것이 없으면(그림자, 초점·밝기 조절) 통과가 아니다 ---
+evaluate("ready(); measuring = true; lastDetectionAt = 0; step(12000, 50, { move: 0 }); step(12033, 50, { move: 2 });");
+assert.equal(evaluate("lastDetectionAt"), 0, "움직이는 면적이 모자라면 통과로 치지 않는다");
+assert.equal(evaluate("detectorState"), "ready");
+evaluate("step(12066, 50, { move: 30 });");
+assert.equal(evaluate("lastDetectionAt"), 12066, "움직이기 시작하면 통과다");
+evaluate("ready(); lastDetectionAt = 0; step(13000, 50, { move: 0 }); step(13500, 50, { move: 0 }); step(14001, 50, { move: 0 });");
+assert.equal(evaluate("lastDetectionAt"), 0);
+assert.equal(evaluate("detectorState"), "learning", "움직임 없는 변화가 1초 넘게 가면 배경을 다시 배운다");
+
+// --- 화면 전체가 가려졌다 돌아옴(손 등) ---
+evaluate("ready(); measuring = true; lastDetectionAt = 0; step(15000, 100, { bright: true });");
+assert.equal(evaluate("lastDetectionAt"), 0, "화면 전체 밝기가 급변한 순간에는 바로 통과로 치지 않는다");
+assert.equal(evaluate("coverSince"), 15000);
+evaluate("step(15033, 95, { bright: true }); step(15066, 0); step(15100, 0);");
+assert.equal(evaluate("lastDetectionAt"), 15000, "금방 원래대로 돌아오면 통과이고, 시각은 가려지기 시작한 때다");
+assert.equal(evaluate("detectorState"), "learning");
+
+evaluate("ready(); lastDetectionAt = 0; step(17000, 100, { bright: true }); step(17400, 100); step(17801, 100);");
+assert.equal(evaluate("lastDetectionAt"), 0, "돌아오지 않으면(조명이 바뀜) 통과가 아니다");
+assert.equal(evaluate("detectorState"), "learning");
+assert.equal(evaluate("learningAfterDetection"), false);
+
+evaluate("els.ignoreShakeInput.checked = false; ready(); measuring = true; step(19000, 50, { shake: true, move: 0 });");
+assert.equal(evaluate("lastDetectionAt"), 19000, "기능을 끄면 확인 없이 바로 통과로 친다");
 evaluate("els.ignoreShakeInput.checked = true;");
 
 // --- 랩 기록과 표시 ---
@@ -143,13 +174,23 @@ assert.equal(evaluate("captureLatencyMs = 0; frameTimestamp(1000, { captureTime:
 // --- 감지 기준 ---
 evaluate('els.autoThresholdInput.checked = false; els.sensitivityInput.value = "17";');
 assert.equal(evaluate("currentThreshold()"), 17);
-evaluate("els.autoThresholdInput.checked = true; noiseMean = 0; noiseDeviation = 0;");
+evaluate("els.autoThresholdInput.checked = true; noiseMean = 0; noiseDeviation = 0; recentPeak = 0;");
 assert.equal(evaluate("currentThreshold()"), 3, "자동 기준의 최솟값");
 evaluate("noiseMean = 2; noiseDeviation = 1;");
 assert.equal(evaluate("currentThreshold()"), 6.5, "평소 변화가 크면 기준을 올린다");
 evaluate("noiseMean = 90;");
 assert.equal(evaluate("currentThreshold()"), 40, "자동 기준의 최댓값");
-evaluate("noiseMean = 0; noiseDeviation = 0;");
+evaluate("noiseMean = 0; noiseDeviation = 0; recentPeak = 4;");
+assert.equal(evaluate("currentThreshold()"), 9, "최근에 튄 값(잔떨림)의 두 배 + 1%보다 위에 둔다");
+
+// 값이 오르는 동안에는 잔떨림으로 기록하지 않는다(들어오는 물체 때문에 기준이 따라 올라가면 안 된다).
+evaluate("recentPeak = 0; pendingPeak = 0; lastAdvanceAt = 0; trackRecentPeak(1000, 1, 3); trackRecentPeak(1033, 2, 3); trackRecentPeak(1066, 2.9, 3);");
+assert.equal(evaluate("recentPeak"), 0, "오르는 중에는 기록을 미룬다");
+evaluate("trackRecentPeak(1100, 0.5, 3);");
+assert.ok(Math.abs(evaluate("recentPeak") - 2.9) < 0.1, "통과 없이 다시 내려가면 그때 기록한다");
+evaluate("recentPeak = 0; pendingPeak = 0; trackRecentPeak(2000, 2, 3); trackRecentPeak(2033, 5, 3); trackRecentPeak(2066, 0, 3);");
+assert.equal(evaluate("recentPeak"), 0, "기준을 넘은 값(물체)은 잔떨림으로 기록하지 않는다");
+evaluate("recentPeak = 0; pendingPeak = 0;");
 
 // --- 배경 모델 ---
 function frame(width, height, paint) {
@@ -163,25 +204,54 @@ function frame(width, height, paint) {
   }
   return { width, height, data };
 }
-const flat = () => [120, 120, 120];
-const patch = (px, py, size) => (x, y) => (x >= px && x < px + size && y >= py && y < py + size) ? [25, 30, 35] : [120, 120, 120];
+const gray = [120, 120, 120];
+const flat = () => gray;
+const box = (px, py, w, h, color) => (x, y) => (x >= px && x < px + w && y >= py && y < py + h) ? color : null;
+const paint = (...layers) => (x, y) => { for (const layer of layers) { const c = layer(x, y); if (c) return c; } return gray; };
+const learn = () => { evaluate("initializeDetector(baseFrame);"); for (let i = 1; i < 30; i += 1) evaluate("updateBackgroundAndMask(baseFrame, true);"); };
 
 context.baseFrame = frame(60, 40, flat);
-context.objectFrame = frame(60, 40, patch(20, 10, 20));
-evaluate("initializeDetector(baseFrame);");
-for (let i = 1; i < 30; i += 1) evaluate("updateBackgroundAndMask(baseFrame, true);");
+context.objectFrame = frame(60, 40, paint(box(20, 10, 20, 20, [25, 30, 35])));
+learn();
 assert.equal(evaluate("learningFrameCount"), 30);
 assert.ok(evaluate("updateBackgroundAndMask(baseFrame, false)") < 0.1);
 assert.ok(evaluate("updateBackgroundAndMask(objectFrame, false)") > 10, "덩어리로 변한 면적을 센다");
+assert.ok(evaluate("moveMotion") > 10, "방금 나타난 물체는 움직이는 중이다");
+evaluate("updateBackgroundAndMask(objectFrame, false)");
+assert.ok(evaluate("moveMotion") < 0.5, "그대로 서 있으면 움직이는 면적이 없다");
 let settledMotion = 100;
 for (let i = 0; i < 300; i += 1) settledMotion = evaluate("updateBackgroundAndMask(objectFrame, false)");
 assert.ok(settledMotion < 1, "머물러 있는 변화는 배경으로 받아들인다");
 
 // 가는 선(흔들림이 남기는 모양)은 덩어리로 세지 않는다
-context.lineFrame = frame(60, 40, (x, y) => (y === 20 || x === 30) ? [25, 30, 35] : [120, 120, 120]);
-evaluate("initializeDetector(baseFrame);");
-for (let i = 1; i < 30; i += 1) evaluate("updateBackgroundAndMask(baseFrame, true);");
+context.lineFrame = frame(60, 40, (x, y) => (y === 20 || x === 30) ? [25, 30, 35] : gray);
+learn();
 assert.ok(evaluate("updateBackgroundAndMask(lineFrame, false)") < 0.5, "가는 선은 통과로 세지 않는다");
+
+// 그림자: 밝기만 조금 낮아진 덩어리는 물체로 세지 않는다
+context.shadowFrame = frame(60, 40, paint(box(15, 8, 30, 24, [104, 104, 104])));
+learn();
+assert.equal(evaluate("updateBackgroundAndMask(shadowFrame, false)"), 0, "옅은 그림자는 세지 않는다");
+
+// 배경과 비슷한 색의 물체: 뚜렷한 부분(바퀴)이 붙어 있으면 옅은 부분까지 통째로 센다
+context.grayCarFrame = frame(60, 40, paint(box(15, 26, 30, 6, [25, 25, 25]), box(15, 8, 30, 24, [104, 104, 104])));
+learn();
+const grayCarMotion = evaluate("updateBackgroundAndMask(grayCarFrame, false)");
+const wheelOnly = (26 * 2) / ((60 - 6) * (40 - 6)) * 100;
+assert.ok(grayCarMotion > wheelOnly * 4, `뚜렷한 부분에 붙은 옅은 부분도 센다 (실제 ${grayCarMotion.toFixed(1)}%)`);
+
+// 색이 다른 물체는 밝기가 같아도 뚜렷한 변화다
+context.colorFrame = frame(60, 40, paint(box(20, 10, 20, 20, [170, 100, 90])));
+learn();
+assert.ok(evaluate("updateBackgroundAndMask(colorFrame, false)") > 10, "색이 다르면 센다");
+
+// 무늬가 촘촘한 배경이 1픽셀 어긋나도 변화로 세지 않는다
+const checker = (shift) => (x, y) => (((x + shift) >> 1) + (y >> 1)) % 2 ? [200, 200, 200] : [60, 60, 60];
+context.baseFrame = frame(60, 40, checker(0));
+context.jitterFrame = frame(60, 40, checker(1));
+learn();
+assert.ok(evaluate("updateBackgroundAndMask(jitterFrame, false)") < 0.5, "무늬 배경의 1픽셀 어긋남은 세지 않는다");
+context.baseFrame = frame(60, 40, flat);
 
 // 화면 전체가 옆으로 밀려도 따라가서 비교한다
 const scene = (shift) => (x, y) => {
@@ -196,7 +266,17 @@ evaluate("initializeDetector(sceneFrame, sceneRoi);");
 for (let i = 1; i < 30; i += 1) evaluate("updateBackgroundAndMask(sceneFrame, true, sceneRoi);");
 const shiftedMotion = evaluate("updateBackgroundAndMask(shiftedFrame, false, sceneRoi)");
 assert.equal(evaluate("globalDx"), 5, "화면 밀림 5px를 찾는다");
-assert.equal(evaluate("frameStable"), false, "갑작스러운 밀림은 불안정으로 본다");
+assert.equal(evaluate("frameShake"), true, "갑작스러운 밀림은 흔들림으로 본다");
 assert.ok(shiftedMotion < 1, `밀림을 따라가면 변화율이 거의 없다 (실제 ${shiftedMotion.toFixed(2)}%)`);
+
+// 천천히 밀린 화면은 다시 학습하지 않고 배경을 옮겨 따라간다
+context.driftFrame = frame(160, 100, scene(9));
+evaluate("initializeDetector(sceneFrame, sceneRoi);");
+for (let i = 1; i < 30; i += 1) evaluate("updateBackgroundAndMask(sceneFrame, true, sceneRoi);");
+evaluate("updateBackgroundAndMask(driftFrame, false, sceneRoi); recenterPending = true;");
+const recentered = evaluate("frameShake = false; frameBright = false; updateBackgroundAndMask(driftFrame, false, sceneRoi)");
+assert.equal(evaluate("globalDx + trackBiasX"), 0, "지금 화면을 새 기준으로 삼는다");
+assert.ok(recentered < 1, `배경을 옮긴 뒤에도 변화율이 거의 없다 (실제 ${recentered.toFixed(2)}%)`);
+assert.ok(evaluate("updateBackgroundAndMask(driftFrame, false, sceneRoi)") < 1);
 
 console.log("state-test: ok");

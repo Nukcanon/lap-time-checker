@@ -7,6 +7,7 @@ const els = {
   debugCanvas: document.querySelector("#debugCanvas"),
   debugPanel: document.querySelector("#debugPanel"),
   debugSize: document.querySelector("#debugSize"),
+  debugInfo: document.querySelector("#debugInfo"),
   cameraEmpty: document.querySelector("#cameraEmpty"),
   cameraHelp: document.querySelector("#cameraHelp"),
   timer: document.querySelector("#timerDisplay"),
@@ -67,6 +68,34 @@ const DISTURB_RELEARN_MS = 1000;
 const STALE_REFERENCE_FRAMES = 15;
 // 감지 영역의 최소 크기(처리 화면 기준 픽셀). 이보다 작으면 덩어리를 셀 자리가 없다.
 const MIN_ROI_PROCESS_PIXELS = 24;
+// 배경과 비교할 때 함께 보는 이웃 범위(픽셀). 미세한 떨림과 무늬 배경을 견디게 한다.
+const NEIGHBOR_RADIUS = 1;
+// 색은 그대로인데 밝기만 이 비율 안에서 변한 것은 "옅은 변화"다. 그림자·조명일 수 있어 그것만으로는 물체로 치지 않는다.
+// 그림자는 어두워지는 쪽이 훨씬 깊으므로 어두워지는 쪽의 폭을 더 넓게 둔다.
+const SHADOW_DARK_RATIO = 0.4;
+const SHADOW_LIGHT_RATIO = 0.2;
+// 덩어리가 물체로 인정받으려면 "뚜렷한 변화"(색이 다르거나 밝기가 크게 다름)가 이만큼은 들어 있어야 한다.
+const SEED_MIN_PIXELS = 8;
+const SEED_MIN_RATIO = 0.1;
+// "지금 움직이는 중"으로 볼 앞 프레임 대비 변화 기준.
+const MOVE_LUMA_THRESHOLD = 12;
+const MOVE_CHROMA_THRESHOLD = 9;
+// 통과로 치려면 변한 면적 중 이 비율 이상이 실제로 움직이고 있어야 한다.
+const MOVE_RATIO = 0.3;
+// 화면 전체가 가려졌다가(손 등) 이 시간 안에 원래대로 돌아오면 통과, 아니면 조명 변화로 본다.
+const COVER_MAX_MS = 800;
+const COVER_CALM_FRAMES = 2;
+// 배경 학습의 마지막 몇 프레임은 감지하듯 처리하며 평소 잔떨림 크기만 잰다.
+const OBSERVE_FRAMES = 8;
+// 자동 기준: 최근 잔떨림 최댓값의 이 배수 + 1%.
+const PEAK_MARGIN = 2;
+const PEAK_DECAY_MS = 4000;
+// 통과 직후 이 시간 동안은 물체가 빠져나가는 중일 수 있어 잔떨림을 재지 않는다.
+const PEAK_SETTLE_MS = 700;
+// 감지 영역 안에서 잰 어긋남을 다음 프레임의 위치에 반영하는 한도(픽셀).
+const TRACK_BIAS_LIMIT = 6;
+// 카메라가 천천히 이만큼 밀리면, 다시 학습하지 않고 배경을 그만큼 옮겨 계속 따라간다.
+const RECENTER_SHIFT = 8;
 const VIDEO_READY_TIMEOUT_MS = 8000;
 
 // 자동 감지 기준.
@@ -140,6 +169,26 @@ let globalDx = 0;
 let globalDy = 0;
 let frameStable = true;
 let frameJolt = false;
+// 이번 프레임의 화면 전체 상태: 급한 흔들림 / 화면 전체 밝기 급변 / 보정 범위 밖.
+let frameShake = false;
+let frameBright = false;
+let frameBeyond = false;
+// 변한 면적 중 지금 움직이고 있는 부분(%).
+let moveMotion = 0;
+let prevY = null;
+let prevCb = null;
+let prevCr = null;
+let moveMask = null;
+let coverSince = 0;
+let coverCalm = 0;
+let slowSince = 0;
+let recentPeak = 0;
+let lastAdvanceAt = 0;
+let trackBiasX = 0;
+let trackBiasY = 0;
+let pendingPeak = 0;
+let fillQueue = null;
+let recenterPending = false;
 let usualJump = 0;
 let holdFrames = 0;
 let staleFrames = 0;
@@ -658,7 +707,13 @@ function resetDetector({ afterDetection = false } = {}) {
   // 실제 통과 직후에만 cooldown 시간을 유지한다.
   holdFrames = 0;
   staleFrames = 0;
+  coverSince = 0;
+  coverCalm = 0;
+  slowSince = 0;
+  moveMotion = 0;
+  pendingPeak = 0;
   if (!afterDetection) {
+    recentPeak = 0;
     lastDetectionAt = 0;
     noiseMean = 0;
     noiseDeviation = 0;
@@ -684,7 +739,8 @@ function updateDetectorStatus() {
       setStatus(`배경 학습 중 ${Math.min(learningFrameCount, LEARNING_FRAMES)}/${LEARNING_FRAMES}`, "learning");
     }
   } else if (detectorState === "ready") {
-    if (disturbedSince) setStatus("흔들림·조명 변화 감지, 잠시 대기", "learning");
+    if (coverSince) setStatus("화면이 가려짐, 확인 중", "learning");
+    else if (disturbedSince) setStatus("흔들림 감지, 잠시 대기", "learning");
     else if (measuring && !timerStarted) setStatus("첫 통과 대기", "measuring");
     else if (measuring) setStatus("랩타임 측정 중", "measuring");
     else setStatus("감지 준비", "ready");
@@ -708,7 +764,9 @@ function currentThreshold() {
   const floor = Math.max(AUTO_MIN_PERCENT, pixelFloor);
   // 평소에도 남는 변화(잔진동 등)가 있으면 그만큼 기준을 올린다.
   const noiseBased = noiseMean + noiseDeviation * 4 + 0.5;
-  return Math.min(AUTO_MAX_PERCENT, Math.max(floor, noiseBased));
+  // 손에 들었거나 바닥이 떨리면 가끔 크게 튀는 값이 있다. 최근 최댓값보다 넉넉히 위에 둔다.
+  const peakBased = recentPeak > 0.2 ? recentPeak * PEAK_MARGIN + 1 : 0;
+  return Math.min(AUTO_MAX_PERCENT, Math.max(floor, noiseBased, peakBased));
 }
 
 function allocateDetectorBuffers(width, height) {
@@ -727,7 +785,12 @@ function allocateDetectorBuffers(width, height) {
   currentCb = new Uint8Array(pixelCount);
   currentCr = new Uint8Array(pixelCount);
   rawMask = new Uint8Array(pixelCount);
+  prevY = new Uint8Array(pixelCount);
+  prevCb = new Uint8Array(pixelCount);
+  prevCr = new Uint8Array(pixelCount);
+  moveMask = new Uint8Array(pixelCount);
   cleanMask = new Uint8Array(pixelCount);
+  fillQueue = new Int32Array(pixelCount);
   debugMask = els.debugCanvas.getContext("2d").createImageData(width, height);
   learningFrameCount = 0;
   modelFrameCount = 0;
@@ -784,6 +847,9 @@ function initializeDetector(frame, rect = wholeFrameRect(frame)) {
   modelFrameCount = 1;
   globalDx = 0;
   globalDy = 0;
+  trackBiasX = 0;
+  trackBiasY = 0;
+  recenterPending = false;
   frameStable = true;
   measureGlobal(frame, rect);
   captureGlobalReference();
@@ -918,7 +984,11 @@ function updateGlobalMotion(frame, rect, adaptRate) {
   const beyondLimit = atEdge || clipped || Math.abs(lightFar) >= LIGHT_FAR_LIMIT;
   staleFrames = beyondLimit ? staleFrames + 1 : 0;
   // 급한 움직임·밝기 변화(jolt)는 다음 프레임까지 잔상이 남을 수 있어 따로 기억한다.
-  frameJolt = jump >= jumpLimit || Math.abs(lightStep) >= LIGHT_JUMP_LIMIT;
+  frameBright = Math.abs(lightStep) >= LIGHT_JUMP_LIMIT || Math.abs(lightFar) >= LIGHT_FAR_LIMIT;
+  // 화면 전체가 가려지면 밀림 값이 엉뚱하게 튈 수 있으므로, 밝기 급변과 겹친 것은 흔들림으로 치지 않는다.
+  frameShake = jump >= jumpLimit && !frameBright;
+  frameBeyond = atEdge || clipped;
+  frameJolt = frameShake || Math.abs(lightStep) >= LIGHT_JUMP_LIMIT;
   const stable = !frameJolt && !beyondLimit;
   // 기준 밝기는 배경 모델과 같은 속도로 따라가야 "배경 대비 밝기 차"를 뜻하게 된다.
   for (let b = 0; b < refBlock.length; b += 1) refBlock[b] += (curBlock[b] - refBlock[b]) * adaptRate;
@@ -1013,10 +1083,13 @@ function estimateAlignment(width, height) {
 }
 
 // 변한 픽셀 중 주변도 함께 변한 "덩어리"만 남긴다.
+// rawMask: 0 = 그대로, 1 = 옅은 변화, 2 = 뚜렷한 변화.
+// 덩어리를 이루는 변화만 남기고(cleanMask = 1), 그중 뚜렷한 변화가 충분히 든 덩어리만 물체로 센다(cleanMask = 2).
+// 그림자처럼 옅기만 한 덩어리는 세지 않고, 색이 비슷한 차는 바퀴·창처럼 뚜렷한 부분 덕분에 통째로 센다.
 function filterMotionMask(width, height) {
   cleanMask.fill(0);
-  let changed = 0;
   const border = MAX_ALIGNMENT_SHIFT + 1;
+  let seeds = 0;
   for (let y = border; y < height - border; y += 1) {
     const row = y * width;
     for (let x = border; x < width - border; x += 1) {
@@ -1024,16 +1097,156 @@ function filterMotionMask(width, height) {
       if (!rawMask[i]) continue;
       const up = i - width;
       const down = i + width;
-      const neighbors = rawMask[up - 1] + rawMask[up] + rawMask[up + 1]
-        + rawMask[i - 1] + rawMask[i + 1]
-        + rawMask[down - 1] + rawMask[down] + rawMask[down + 1];
+      let neighbors = 0;
+      if (rawMask[up - 1]) neighbors += 1;
+      if (rawMask[up]) neighbors += 1;
+      if (rawMask[up + 1]) neighbors += 1;
+      if (rawMask[i - 1]) neighbors += 1;
+      if (rawMask[i + 1]) neighbors += 1;
+      if (rawMask[down - 1]) neighbors += 1;
+      if (rawMask[down]) neighbors += 1;
+      if (rawMask[down + 1]) neighbors += 1;
       if (neighbors >= SOLID_NEIGHBOR_MIN) {
         cleanMask[i] = 1;
-        changed += 1;
+        if (rawMask[i] === 2) seeds += 1;
       }
     }
   }
-  return changed;
+  if (seeds < SEED_MIN_PIXELS) return 0;
+
+  // 뚜렷한 픽셀에서 출발해 이어진 덩어리를 따라가며 크기와 뚜렷한 픽셀 수를 센다.
+  let counted = 0;
+  for (let y = border; y < height - border; y += 1) {
+    const row = y * width;
+    for (let x = border; x < width - border; x += 1) {
+      const start = row + x;
+      if (cleanMask[start] !== 1 || rawMask[start] !== 2) continue;
+      let head = 0;
+      let tail = 0;
+      let strong = 0;
+      fillQueue[tail++] = start;
+      cleanMask[start] = 3;
+      while (head < tail) {
+        const i = fillQueue[head++];
+        if (rawMask[i] === 2) strong += 1;
+        for (let ny = -width; ny <= width; ny += width) {
+          for (let nx = -1; nx <= 1; nx += 1) {
+            const n = i + ny + nx;
+            if (cleanMask[n] === 1) {
+              cleanMask[n] = 3;
+              fillQueue[tail++] = n;
+            }
+          }
+        }
+      }
+      const isObject = strong >= SEED_MIN_PIXELS && strong >= tail * SEED_MIN_RATIO;
+      if (isObject) counted += tail;
+      // 3(방문함)을 2(물체) 또는 4(물체 아님, 다시 보지 않음)로 확정한다.
+      for (let k = 0; k < tail; k += 1) cleanMask[fillQueue[k]] = isObject ? 2 : 4;
+    }
+  }
+  // 4는 화면 표시용으로 1(옅은 변화)과 같게 되돌린다.
+  for (let i = 0; i < cleanMask.length; i += 1) if (cleanMask[i] === 4) cleanMask[i] = 1;
+  return counted;
+}
+
+// 배열 하나를 (shiftX, shiftY)만큼 옮긴다. 새로 드러난 자리는 fill(i)로 채운다.
+function shiftPlane(plane, width, height, shiftX, shiftY, fill) {
+  const old = plane.slice();
+  for (let y = 0; y < height; y += 1) {
+    const sy = y - shiftY;
+    const row = y * width;
+    for (let x = 0; x < width; x += 1) {
+      const sx = x - shiftX;
+      const i = row + x;
+      plane[i] = (sx >= 0 && sx < width && sy >= 0 && sy < height) ? old[sy * width + sx] : fill(i);
+    }
+  }
+}
+
+// 카메라가 천천히 밀려 보정 범위 끝에 가까워지면, 배경을 밀린 만큼 옮기고 지금 화면을 새 기준으로 삼는다.
+// 다시 학습하지 않으므로 그동안 통과를 놓치지 않는다.
+function recenterModel(frame, rect) {
+  const width = rect.width;
+  const height = rect.height;
+  const shiftX = globalDx + trackBiasX;
+  const shiftY = globalDy + trackBiasY;
+  refCol = Float32Array.from(curCol);
+  refRow = Float32Array.from(curRow);
+  globalDx = 0;
+  globalDy = 0;
+  trackBiasX = 0;
+  trackBiasY = 0;
+  extractYcbcr(frame, rect, 0, 0);
+  // 배경의 (x, y)는 예전에는 화면의 (x + shift) 자리였다. 이제 화면의 (x) 자리가 되게 옮긴다.
+  shiftPlane(backgroundY, width, height, shiftX, shiftY, (i) => currentY[i]);
+  shiftPlane(backgroundCb, width, height, shiftX, shiftY, (i) => currentCb[i]);
+  shiftPlane(backgroundCr, width, height, shiftX, shiftY, (i) => currentCr[i]);
+  shiftPlane(varianceY, width, height, shiftX, shiftY, () => INITIAL_VARIANCE_Y);
+  shiftPlane(varianceCb, width, height, shiftX, shiftY, () => INITIAL_VARIANCE_C);
+  shiftPlane(varianceCr, width, height, shiftX, shiftY, () => INITIAL_VARIANCE_C);
+  shiftPlane(prevY, width, height, shiftX, shiftY, (i) => currentY[i]);
+  shiftPlane(prevCb, width, height, shiftX, shiftY, (i) => currentCb[i]);
+  shiftPlane(prevCr, width, height, shiftX, shiftY, (i) => currentCr[i]);
+  candidateCount.fill(0);
+}
+
+// 표시된 픽셀 중 덩어리를 이루는 것의 개수만 센다.
+function countSolid(mask, width, height) {
+  let count = 0;
+  const border = MAX_ALIGNMENT_SHIFT + 1;
+  for (let y = border; y < height - border; y += 1) {
+    const row = y * width;
+    for (let x = border; x < width - border; x += 1) {
+      const i = row + x;
+      if (!mask[i]) continue;
+      const up = i - width;
+      const down = i + width;
+      const neighbors = mask[up - 1] + mask[up] + mask[up + 1] + mask[i - 1] + mask[i + 1] + mask[down - 1] + mask[down] + mask[down + 1];
+      if (neighbors >= SOLID_NEIGHBOR_MIN) count += 1;
+    }
+  }
+  return count;
+}
+
+// 다음 프레임과 비교할 수 있게 이번 프레임을 배경 좌표로 저장한다.
+function rememberFrame(width, height, alignment) {
+  for (let y = 0; y < height; y += 1) {
+    const cy = Math.max(0, Math.min(height - 1, y + alignment.dy));
+    const row = y * width;
+    const curRowIndex = cy * width;
+    for (let x = 0; x < width; x += 1) {
+      const cx = Math.max(0, Math.min(width - 1, x + alignment.dx));
+      const i = row + x;
+      const curIndex = curRowIndex + cx;
+      const luma = currentY[curIndex] - alignment.lumaOffset;
+      prevY[i] = luma < 0 ? 0 : (luma > 255 ? 255 : luma);
+      prevCb[i] = currentCb[curIndex];
+      prevCr[i] = currentCr[curIndex];
+    }
+  }
+}
+
+// 앞 프레임의 같은 자리(이웃 포함)와 비교해 이 픽셀이 지금 움직이는 중인지 본다.
+function movedSincePrevious(i, width, luma, cb, cr) {
+  let yLow = 255, yHigh = 0, cbLow = 255, cbHigh = 0, crLow = 255, crHigh = 0;
+  for (let ny = -1; ny <= 1; ny += 1) {
+    const base = i + ny * width;
+    for (let nx = -1; nx <= 1; nx += 1) {
+      const n = base + nx;
+      const py = prevY[n], pcb = prevCb[n], pcr = prevCr[n];
+      if (py < yLow) yLow = py;
+      if (py > yHigh) yHigh = py;
+      if (pcb < cbLow) cbLow = pcb;
+      if (pcb > cbHigh) cbHigh = pcb;
+      if (pcr < crLow) crLow = pcr;
+      if (pcr > crHigh) crHigh = pcr;
+    }
+  }
+  const dY = luma < yLow ? yLow - luma : (luma > yHigh ? luma - yHigh : 0);
+  const dCb = cb < cbLow ? cbLow - cb : (cb > cbHigh ? cb - cbHigh : 0);
+  const dCr = cr < crLow ? crLow - cr : (cr > crHigh ? cr - crHigh : 0);
+  return dY > MOVE_LUMA_THRESHOLD || (dCb * dCb + dCr * dCr) > MOVE_CHROMA_THRESHOLD * MOVE_CHROMA_THRESHOLD;
 }
 
 function updateBackgroundPixel(i, curIndex, alpha, lumaResidual, cbResidual, crResidual) {
@@ -1083,7 +1296,7 @@ function updateDebugMask(width, height) {
   if (!debugVisible) return;
   const pixelCount = width * height;
   for (let p = 0, i = 0; p < pixelCount; p += 1, i += 4) {
-    const value = cleanMask[p] ? 255 : 0;
+    const value = cleanMask[p] === 2 ? 255 : (cleanMask[p] ? 90 : 0);
     debugMask.data[i] = value;
     debugMask.data[i + 1] = value;
     debugMask.data[i + 2] = value;
@@ -1103,16 +1316,30 @@ function updateBackgroundAndMask(frame, learning, rect = wholeFrameRect(frame)) 
   const learningAlpha = 1 / Math.min(Math.max(2, learningFrameCount + 1), 20);
   const readyAlpha = 1 / modelWindowFrames();
   frameStable = updateGlobalMotion(frame, rect, learning ? learningAlpha : readyAlpha);
-  extractYcbcr(frame, rect, globalDx, globalDy);
+  if (recenterPending) {
+    recenterPending = false;
+    if (!frameShake && !frameBright) recenterModel(frame, rect);
+  }
+  const startX = rect.x + globalDx + trackBiasX;
+  const startY = rect.y + globalDy + trackBiasY;
+  if (startX < 0 || startX + width > frame.width) trackBiasX = 0;
+  if (startY < 0 || startY + height > frame.height) trackBiasY = 0;
+  extractYcbcr(frame, rect, globalDx + trackBiasX, globalDy + trackBiasY);
   const alignment = estimateAlignment(width, height);
+  // 화면 전체로 잰 밀림이 조금 늦거나 어긋나면 감지 영역 안에서 잰 값으로 다음 프레임의 위치를 바로잡는다.
+  const nextBiasX = Math.max(-TRACK_BIAS_LIMIT, Math.min(TRACK_BIAS_LIMIT, trackBiasX + alignment.dx));
+  const nextBiasY = Math.max(-TRACK_BIAS_LIMIT, Math.min(TRACK_BIAS_LIMIT, trackBiasY + alignment.dy));
   modelFrameCount += 1;
 
   rawMask.fill(0);
   cleanMask.fill(0);
+  moveMask.fill(0);
+  moveMotion = 0;
 
   if (learning) {
-    // MOG2의 초기 빠른 적응을 흉내낸다. 20프레임 이후에도 0.05로 계속 학습하여
-    // 통과 직후 자동차가 아직 ROI에 남아 있더라도 cooldown 동안 새 배경으로 회복한다.
+    // MOG2의 초기 빠른 적응을 흉내낸다. 이 빠른 학습은 처음 22프레임만 하고,
+    // 그 뒤(관찰 단계)에는 감지할 때와 같은 방식으로 배경을 따라간다. 통과 직후 차가 아직 남아 있었다면
+    // 섞여 들어간 부분은 "머무는 변화 흡수"로 회복된다.
     for (let y = 0; y < height; y += 1) {
       const cy = y + alignment.dy;
       if (cy < 0 || cy >= height) continue;
@@ -1130,6 +1357,9 @@ function updateBackgroundAndMask(frame, learning, rect = wholeFrameRect(frame)) 
       }
     }
     learningFrameCount += 1;
+    rememberFrame(width, height, alignment);
+    trackBiasX = nextBiasX;
+    trackBiasY = nextBiasY;
     updateDebugMask(width, height);
     return 0;
   }
@@ -1145,16 +1375,48 @@ function updateBackgroundAndMask(frame, learning, rect = wholeFrameRect(frame)) 
       if (cx < 0 || cx >= width) continue;
       const i = row + x;
       const curIndex = curRowIndex + cx;
-      const dY = currentY[curIndex] - backgroundY[i] - alignment.lumaOffset;
-      const dCb = currentCb[curIndex] - backgroundCb[i];
-      const dCr = currentCr[curIndex] - backgroundCr[i];
+      const luma = currentY[curIndex] - alignment.lumaOffset;
+      const cb = currentCb[curIndex];
+      const cr = currentCr[curIndex];
+      let dY = luma - backgroundY[i];
+      let dCb = cb - backgroundCb[i];
+      let dCr = cr - backgroundCr[i];
 
       const yThreshold = Math.max(LUMA_BASE_THRESHOLD, Math.sqrt(varianceY[i]) * NOISE_SIGMA_MULTIPLIER);
       const cbThreshold = Math.max(CHROMA_BASE_THRESHOLD, Math.sqrt(varianceCb[i]) * NOISE_SIGMA_MULTIPLIER);
       const crThreshold = Math.max(CHROMA_BASE_THRESHOLD, Math.sqrt(varianceCr[i]) * NOISE_SIGMA_MULTIPLIER);
-      const chromaChanged = (dCb * dCb + dCr * dCr) > (cbThreshold * cbThreshold + crThreshold * crThreshold);
+      const chromaLimit = cbThreshold * cbThreshold + crThreshold * crThreshold;
+      if (Math.abs(dY) <= yThreshold && (dCb * dCb + dCr * dCr) <= chromaLimit) continue;
 
-      if (Math.abs(dY) > yThreshold || chromaChanged) rawMask[i] = 1;
+      // 무늬가 촘촘한 배경은 화면이 1픽셀만 어긋나도 값이 크게 달라진다.
+      // 그래서 배경의 이웃 픽셀들이 가진 값의 범위 안이면 "배경 그대로"로 본다.
+      let yLow = backgroundY[i], yHigh = yLow, cbLow = backgroundCb[i], cbHigh = cbLow, crLow = backgroundCr[i], crHigh = crLow;
+      for (let ny = -NEIGHBOR_RADIUS; ny <= NEIGHBOR_RADIUS; ny += 1) {
+        const base = i + ny * width;
+        for (let nx = -NEIGHBOR_RADIUS; nx <= NEIGHBOR_RADIUS; nx += 1) {
+          const n = base + nx;
+          const by = backgroundY[n], bcb = backgroundCb[n], bcr = backgroundCr[n];
+          if (by < yLow) yLow = by; else if (by > yHigh) yHigh = by;
+          if (bcb < cbLow) cbLow = bcb; else if (bcb > cbHigh) cbHigh = bcb;
+          if (bcr < crLow) crLow = bcr; else if (bcr > crHigh) crHigh = bcr;
+        }
+      }
+      dY = luma < yLow ? yLow - luma : (luma > yHigh ? luma - yHigh : 0);
+      dCb = cb < cbLow ? cbLow - cb : (cb > cbHigh ? cb - cbHigh : 0);
+      dCr = cr < crLow ? crLow - cr : (cr > crHigh ? cr - crHigh : 0);
+      if (dY > yThreshold || (dCb * dCb + dCr * dCr) > chromaLimit) {
+        // 그림자는 밝기를 일정 비율로 낮추고 색 성분도 같은 비율로 줄인다.
+        // 그 비율을 감안하고도 색이 다르거나, 밝기가 그림자 폭을 넘게 다르면 "뚜렷한 변화"다.
+        const base = backgroundY[i] > 1 ? backgroundY[i] : 1;
+        let gain = luma / base;
+        if (gain < 0.4) gain = 0.4; else if (gain > 1.6) gain = 1.6;
+        const sCb = (cb - 128) - (backgroundCb[i] - 128) * gain;
+        const sCr = (cr - 128) - (backgroundCr[i] - 128) * gain;
+        const strong = dY > Math.max(yThreshold, base * (luma < base ? SHADOW_DARK_RATIO : SHADOW_LIGHT_RATIO))
+          || ((dCb * dCb + dCr * dCr) > chromaLimit && (sCb * sCb + sCr * sCr) > chromaLimit);
+        rawMask[i] = strong ? 2 : 1;
+        if (movedSincePrevious(i, width, luma, cb, cr)) moveMask[i] = 1;
+      }
     }
   }
 
@@ -1185,6 +1447,10 @@ function updateBackgroundAndMask(frame, learning, rect = wholeFrameRect(frame)) 
     }
   }
 
+  moveMotion = Math.min(100, countSolid(moveMask, width, height) / countableArea(width, height) * 100);
+  rememberFrame(width, height, alignment);
+  trackBiasX = nextBiasX;
+  trackBiasY = nextBiasY;
   updateDebugMask(width, height);
   return Math.min(100, changedPixels / countableArea(width, height) * 100);
 }
@@ -1199,12 +1465,52 @@ function drawDebugMask(width, height) {
   els.debugSize.textContent = `${width} × ${height}`;
 }
 
+// 감지 상태 창에 지금 값들을 숫자로 보여준다. 왜 통과로 쳤는지(안 쳤는지) 확인할 때 쓴다.
+function updateDebugInfo(motion) {
+  if (!debugVisible) return;
+  els.debugInfo.textContent = detectorState === "learning"
+    ? `배경 학습 중 · 기준 ${currentThreshold().toFixed(1)}%`
+    : `변한 면적 ${motion.toFixed(1)}% · 움직이는 면적 ${moveMotion.toFixed(1)}% · 기준 ${currentThreshold().toFixed(1)}%`;
+}
+
 function markLap(flag) {
   if (measuring && timerStarted) lapFlags.add(flag);
 }
 
-function advanceDetectorState(time, motion, stable = true) {
+// 잔떨림으로 가끔 튀는 값의 최근 최댓값. 시간이 지나면 서서히 잊는다.
+function trackRecentPeak(time, motion, threshold) {
+  const elapsed = lastAdvanceAt ? Math.max(0, Math.min(1000, time - lastAdvanceAt)) : 0;
+  recentPeak *= Math.exp(-elapsed / PEAK_DECAY_MS);
+  // 기준을 넘은 값은 잔떨림이 아니라 물체일 수 있으므로 넣지 않는다.
+  // (넣으면 측정 전에 차가 지나갈 때마다 기준이 계단처럼 올라간다.)
+  if (motion > threshold) {
+    pendingPeak = 0;
+    return;
+  }
+  // 값이 오르는 중이면 물체가 들어오는 중일 수 있으므로 기다린다. 통과 없이 다시 내려갔을 때만 잔떨림으로 기록한다.
+  if (motion > pendingPeak) {
+    pendingPeak = motion;
+    return;
+  }
+  if (pendingPeak > recentPeak) recentPeak = pendingPeak;
+  pendingPeak = motion;
+}
+
+function firePass(time) {
+  lastDetectionAt = time;
+  handlePass(time);
+  resetDetector({ afterDetection: true });
+}
+
+function advanceDetectorState(time, motion) {
+  const threshold = currentThreshold();
+  const calmView = !frameShake && !frameBright && !frameBeyond && holdFrames === 0;
+
   if (detectorState === "learning") {
+    // 학습 끝부분(관찰)에서 잰 평소 잔떨림을 자동 기준에 반영한다.
+    const settled = !learningAfterDetection || time - lastDetectionAt >= PEAK_SETTLE_MS;
+    if (learningFrameCount > LEARNING_FRAMES - OBSERVE_FRAMES && calmView && settled) trackRecentPeak(time, motion, threshold);
+    lastAdvanceAt = time;
     const learnedEnough = learningFrameCount >= LEARNING_FRAMES;
     const cooldown = Number(els.cooldownInput.value);
     const cooldownComplete = !learningAfterDetection || (time - lastDetectionAt >= cooldown);
@@ -1213,55 +1519,107 @@ function advanceDetectorState(time, motion, stable = true) {
       learningAfterDetection = false;
       disturbedSince = 0;
       calmFrames = 0;
+      coverSince = 0;
+      slowSince = 0;
     }
     return;
   }
 
   if (detectorState !== "ready") return;
-  const threshold = currentThreshold();
+  const active = motion > threshold;
 
   // 카메라가 보정 범위 밖으로 밀렸거나 밝기가 크게 달라진 채로 머물면, 그 상태를 새 배경으로 다시 배운다.
-  if (staleFrames >= STALE_REFERENCE_FRAMES) {
+  if (staleFrames >= STALE_REFERENCE_FRAMES && !coverSince) {
     markLap("shake");
     resetDetector();
     return;
   }
 
-  // 화면 전체가 급하게 흔들리거나 조명이 바뀐 순간에 생긴 변화는 통과로 치지 않는다.
-  // 흔들려도 변화율이 기준 아래면(보정이 된 것) 아무 일도 하지 않으므로 감지가 끊기지 않는다.
-  if (els.ignoreShakeInput.checked) {
-    if (!stable && frameJolt) holdFrames = DISTURB_HOLD_FRAMES;
-    const shaky = !stable || holdFrames > 0;
-    if (stable && holdFrames > 0) holdFrames -= 1;
-    if (!disturbedSince && shaky && motion > threshold) {
-      disturbedSince = time;
-      calmFrames = 0;
-      markLap("shake");
-    } else if (disturbedSince) {
-      calmFrames = motion <= threshold ? calmFrames + 1 : 0;
-      if (calmFrames >= DISTURB_RECOVER_FRAMES) disturbedSince = 0;
-    }
-    if (disturbedSince) {
-      // 화면이 원래대로 돌아오지 않으면 배경을 다시 배운다.
-      if (time - disturbedSince >= DISTURB_RELEARN_MS) {
-        resetDetector();
-        if (measuring) showToast("화면이 크게 바뀌어 배경을 다시 학습합니다.");
-      }
-      return;
-    }
-  } else {
+  if (!els.ignoreShakeInput.checked) {
+    // 확인 절차 없이, 기준을 넘으면 바로 통과로 친다.
     disturbedSince = 0;
     holdFrames = 0;
-  }
-
-  if (measuring && motion > threshold) {
-    lastDetectionAt = time;
-    handlePass(time);
-    resetDetector({ afterDetection: true });
+    coverSince = 0;
+    slowSince = 0;
+    if (measuring && active) firePass(time);
+    lastAdvanceAt = time;
     return;
   }
 
-  if (stable && holdFrames === 0 && motion <= threshold) {
+  // 1) 화면 전체가 가려진 뒤(손 등) 원래 모습으로 돌아오기를 기다리는 중.
+  if (coverSince) {
+    coverCalm = !active && !frameBright ? coverCalm + 1 : 0;
+    if (coverCalm >= COVER_CALM_FRAMES) {
+      // 금방 돌아왔다 = 무언가 지나갔다. 가려지기 시작한 시각이 통과 시각이다.
+      const startedAt = coverSince;
+      coverSince = 0;
+      if (measuring) firePass(startedAt);
+    } else if (time - coverSince >= COVER_MAX_MS) {
+      // 돌아오지 않는다 = 조명이 바뀌었거나 화면이 달라졌다.
+      resetDetector();
+      if (measuring) showToast("화면이 크게 바뀌어 배경을 다시 학습합니다.");
+    }
+    lastAdvanceAt = time;
+    return;
+  }
+
+  // 2) 화면 전체가 급하게 흔들린 순간에 생긴 변화는 통과로 치지 않는다.
+  //    흔들려도 변화율이 기준 아래면(보정이 된 것) 아무 일도 하지 않으므로 감지가 끊기지 않는다.
+  if (frameShake) holdFrames = DISTURB_HOLD_FRAMES;
+  const shaky = frameShake || frameBeyond || holdFrames > 0;
+  if (!frameShake && holdFrames > 0) holdFrames -= 1;
+  if (!disturbedSince && shaky && active) {
+    disturbedSince = time;
+    calmFrames = 0;
+    markLap("shake");
+  } else if (disturbedSince) {
+    calmFrames = active ? 0 : calmFrames + 1;
+    if (calmFrames >= DISTURB_RECOVER_FRAMES) disturbedSince = 0;
+  }
+  if (disturbedSince) {
+    // 화면이 원래대로 돌아오지 않으면 배경을 다시 배운다.
+    if (time - disturbedSince >= DISTURB_RELEARN_MS) {
+      resetDetector();
+      if (measuring) showToast("화면이 크게 바뀌어 배경을 다시 학습합니다.");
+    }
+    lastAdvanceAt = time;
+    return;
+  }
+
+  if (active) {
+    if (frameBright) {
+      // 3) 화면 전체 밝기가 함께 급변했다. 손처럼 큰 것이 가렸는지, 조명이 바뀐 것인지는 돌아오는지를 보고 정한다.
+      if (measuring) {
+        coverSince = time;
+        coverCalm = 0;
+      }
+    } else if (moveMotion >= threshold * MOVE_RATIO) {
+      // 4) 감지 영역 안에서 무언가가 지금 움직이고 있다 = 통과.
+      slowSince = 0;
+      if (measuring) {
+        firePass(time);
+        lastAdvanceAt = time;
+        return;
+      }
+    } else {
+      // 5) 변하긴 했지만 움직이는 것이 없다(그림자, 초점·밝기 조절). 통과로 치지 않고, 오래 가면 다시 배운다.
+      if (!slowSince) slowSince = time;
+      if (time - slowSince >= DISTURB_RELEARN_MS) {
+        resetDetector();
+        return;
+      }
+    }
+  } else {
+    slowSince = 0;
+  }
+
+  trackRecentPeak(time, motion, threshold);
+  lastAdvanceAt = time;
+  if (calmView && !active && motion <= threshold * 0.5
+    && Math.max(Math.abs(globalDx + trackBiasX), Math.abs(globalDy + trackBiasY)) >= RECENTER_SHIFT) {
+    recenterPending = true;
+  }
+  if (calmView && !active) {
     noiseMean += (motion - noiseMean) * 0.02;
     noiseDeviation += (Math.abs(motion - noiseMean) - noiseDeviation) * 0.02;
   }
@@ -1325,13 +1683,17 @@ function processFrame(now, metadata) {
       updateDetectorStatus();
       return;
     }
-    const learning = detectorState === "learning";
+    // 학습의 마지막 몇 프레임과 통과 뒤 대기 시간에는 감지하듯 처리하되 통과로 치지는 않는다.
+    const observing = detectorState === "learning" && learningFrameCount >= LEARNING_FRAMES - OBSERVE_FRAMES;
+    const learning = detectorState === "learning" && !observing;
     const width = roiRect.width;
     const height = roiRect.height;
     const motion = updateBackgroundAndMask(frame, learning, roiRect);
-    updateMotionMeter(motion);
+    if (observing) learningFrameCount += 1;
+    updateMotionMeter(observing ? 0 : motion);
     drawDebugMask(width, height);
-    advanceDetectorState(time, motion, frameStable);
+    updateDebugInfo(motion);
+    advanceDetectorState(time, motion);
     updateThresholdLabel();
     updateDetectorStatus();
   } catch (error) {
@@ -1483,6 +1845,7 @@ els.debugButton.addEventListener("click", () => {
   debugVisible = !debugVisible;
   els.debugPanel.hidden = !debugVisible;
   els.debugButton.setAttribute("aria-pressed", String(debugVisible));
+  els.debugButton.textContent = debugVisible ? "감지 상태 닫기" : "감지 상태 보기";
 });
 els.resetBackgroundButton.addEventListener("click", () => {
   resetDetector();
