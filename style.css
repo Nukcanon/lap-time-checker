@@ -144,9 +144,11 @@ button, select, input[type="range"] { touch-action: manipulation; }
 .lap-count { padding: 5px 8px; border-radius: 8px; color: var(--primary); background: #edf6ff; font-size: .68rem; font-weight: 850; }
 
 .lap-list { display: grid; gap: 7px; max-height: 245px; margin: 0; padding: 0; overflow: auto; list-style: none; }
-.lap-row { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 12px; min-height: 47px; padding: 8px 11px; border: 1px solid #e4ebf3; border-radius: 11px; background: var(--surface-soft); }
+.lap-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; min-height: 47px; padding: 8px 11px; border: 1px solid #e4ebf3; border-radius: 11px; background: var(--surface-soft); }
 .lap-number { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 8px; color: var(--primary); background: #e6f3ff; font-size: .72rem; font-weight: 850; }
 .lap-time { justify-self: end; color: #243047; font-size: 1rem; font-weight: 820; font-variant-numeric: tabular-nums; }
+.lap-flags { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.lap-flag { padding: 2px 8px; border: 1px solid #f5d79b; border-radius: 999px; color: #8a5a00; background: #fff6e0; font-size: .66rem; font-weight: 760; white-space: nowrap; }
 .empty-row { padding: 28px 8px; color: #8291a5; font-size: .78rem; text-align: center; }
 
 .icon-button { display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 1px solid #dce5ef; border-radius: 10px; color: #54708f; background: #f4f7fb; cursor: pointer; }
@@ -157,6 +159,11 @@ button, select, input[type="range"] { touch-action: manipulation; }
 .field > span { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .field output { color: var(--primary); font-weight: 850; font-variant-numeric: tabular-nums; }
 .field small { color: #7a899d; font-size: .7rem; line-height: 1.4; }
+.field input[type="range"]:disabled { opacity: .45; }
+.check-field { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: 10px; margin-top: 15px; color: #334155; font-size: .82rem; cursor: pointer; }
+.check-field input { width: 18px; height: 18px; margin: 1px 0 0; accent-color: var(--primary); }
+.check-field > span { display: grid; gap: 3px; }
+.check-field small { color: #7a899d; font-size: .7rem; line-height: 1.4; }
 .field select { width: 100%; min-height: 42px; padding: 0 11px; border: 1px solid #d5e0eb; border-radius: 10px; color: #334155; background: #fff; }
 .field input[type="range"] { width: 100%; accent-color: var(--primary); }
 

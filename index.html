@@ -7,8 +7,8 @@
   <meta name="description" content="카메라의 선택 영역에서 움직임을 감지하여 랩타임을 기록하는 웹앱">
   <title>LapTimeCheck</title>
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
-  <link rel="stylesheet" href="style.css?v=20260915-6">
-  <script defer src="app.js?v=20260915-5"></script>
+  <link rel="stylesheet" href="style.css?v=20261115-1">
+  <script defer src="app.js?v=20261115-1"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace">본문으로 바로가기</a>
@@ -102,7 +102,22 @@
           <label class="field range-field" for="sensitivityInput">
             <span><strong>감지 기준</strong><output id="sensitivityOutput">20%</output></span>
             <input id="sensitivityInput" type="range" min="1" max="80" step="1" value="20">
-            <small>Android 앱과 같은 변화 면적(%) 기준입니다. 낮을수록 민감합니다.</small>
+            <small>감지 영역에서 덩어리로 변한 면적이 이 값을 넘으면 통과로 봅니다. 낮을수록 민감합니다.</small>
+          </label>
+
+          <label class="check-field" for="autoThresholdInput">
+            <input id="autoThresholdInput" type="checkbox" checked>
+            <span><strong>감지 기준 자동</strong><small>평소 흔들림 수준을 보고 기준을 스스로 정합니다. 끄면 위 값을 직접 정합니다.</small></span>
+          </label>
+
+          <label class="check-field" for="ignoreShakeInput">
+            <input id="ignoreShakeInput" type="checkbox" checked>
+            <span><strong>흔들림·조명 변화 무시</strong><small>화면 전체가 흔들리거나 밝기가 바뀐 순간은 통과로 치지 않습니다.</small></span>
+          </label>
+
+          <label class="check-field" for="lockCameraInput">
+            <input id="lockCameraInput" type="checkbox">
+            <span><strong>측정 중 초점·색 고정</strong><small>카메라가 초점과 색을 다시 맞추며 생기는 오감지를 줄입니다. 일부 기기만 지원합니다.</small></span>
           </label>
 
           <label class="field range-field" for="historyInput">
